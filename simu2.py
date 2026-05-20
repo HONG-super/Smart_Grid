@@ -124,28 +124,6 @@ def should_hold_charge(current_tick, expected_prices_array, current_price, Estor
     return True
 
 
-def claude_scheduler(price_forecast, deferrable):
-    schedule = {}
-    for i in range(50):
-        for p in deferrable:
-            start = p['start']
-            end = p['end']
-            power_per_chunk = p['energy'] / 50
-
-            cheapest = 100000
-            cheapest_index = start  # SAFETY FALLBACK
-
-            for j in range(start, end):
-                # Only skip the solar window IF the load has room outside of it!
-                if 20 <= j <= 40 and (end - start > 20):
-                    continue
-                if price_forecast[j] < cheapest:
-                    cheapest = price_forecast[j]
-                    cheapest_index = j
-
-            price_forecast[cheapest_index] = price_forecast[cheapest_index] + power_per_chunk
-            schedule[cheapest_index] = schedule.get(cheapest_index, 0) + power_per_chunk
-    return price_forecast, schedule
 
 def all_3 (price_forecast, deferrable):
     #places 3 chunks at once
