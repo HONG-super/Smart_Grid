@@ -1,10 +1,12 @@
+from sys import get_int_max_str_digits
+
 import numpy as np
 import time as time
 import math as math
 
-from chooser import chooser
+
 import requests
-from chooser import naive_chooser
+
 
 SECS_PER_DAY = 300.0
 TICKS_PER_DAY = 60
@@ -26,6 +28,16 @@ BUY_RATIO = 0.5
 DEMAND_RND_VAR = 1.0
 PRICE_RND_VAR = 20.0
 PRICE_SOLAR_DEP = 1.0
+
+
+E_max = 10
+P_maxCharge = 1
+P_maxDischarge = 1
+Tick_duration = 5
+
+charge_Energy = (P_maxCharge *Tick_duration)/E_max
+discharge_Energy  = (P_maxDischarge*Tick_duration)/E_max
+
 API_URL = 'https://icelec50015.azurewebsites.net'
 
 
@@ -80,47 +92,115 @@ def get_expected_prices():
         expected_prices.append(max(price, PRICE_MIN))
     return expected_prices
 
+def chooser(current_price, hold_charge, solar, load, E_max,expected_future_peak,storedF):
+    surplus = solar - load
+# free solar  when store it
+    if surplus > 0 and storedF<1: # if there is a surplus and the energy stored is less than the max  then store
+        # change in the amount stored
+        change_storedP = (surplus*Tick_duration)/E_max
+        change_storedP = min(change_storedP,charge_Energy,1-storedF) # it finds whether the limit is the max capacity or the charging limit
+        storedF = storedF + change_storedP
+        # now the amount that is being used
+        P_absorbed = change_storedP*E_max /Tick_duration
+        P_grid = -(surplus - P_absorbed)
+# if the battery is full then sell the rest
+    elif surplus > 0 and storedF >=1 : # if surplus is greater than and full then just buy from grid
+        P_grid = -surplus
+# if there is a deficit, and room in batt
+    elif surplus <= 0 and storedF < 1 and expected_future_peak> (2*current_price+20 ): # if there is a deficit and stored< max and low price but also not high demand because then can get expensive
+        deficit = load - solar
+        change_capacity = min(charge_Energy,1-storedF)
+        P_grid =(deficit) + (change_capacity*E_max)/Tick_duration
+        storedF = storedF + change_capacity
+
+    elif surplus <= 0 and storedF< 1 and expected_future_peak> (current_price+20 ): # if the peak is greater than the current price + the max noise then charge to save money late r
+        deficit = load - solar
+        change_capacity = min(charge_Energy, 1 - storedF)
+        P_grid = deficit + (change_capacity * E_max) / Tick_duration
+        storedF = storedF + change_capacity
+
+    elif surplus < 0 and storedF > 0 and hold_charge: # if there is no surpuls and stored is greater than 0 but it says to hold the charge for a larger peak then use grid to cover the difference
+        P_grid = load - solar
+
+    elif surplus < 0 and storedF> 0 and not hold_charge: # if there is a deficit and Estored is greater than 0 and hold charge says go then it is a peak
+        deficit = load - solar
+        change_capacity = min(discharge_Energy, storedF)
+        storedF = storedF - change_capacity
+        P_grid = deficit - (change_capacity * E_max) / Tick_duration
 
 
-def should_hold_charge(current_tick, expected_prices_array, current_price, Estored, E_max):
+    elif surplus < 0 and storedF <= 0: # if deficit and no stored then take from grid
+        P_grid = load - solar
+
+    else:
+        P_grid = 0
+
+    return P_grid, storedF
+
+#################-TEMPORARY
+def naive_chooser(solar, load, E_max, Estored):
+    surplus = solar - load
+
+    if surplus > 0:  # Extra solar: Charge battery first, sell the rest
+        charge = min(E_max - Estored, surplus * 5, P_maxCharge * Tick_duration)
+        Estored = Estored + charge
+        P_grid = -(surplus - (charge / 5))
+
+    elif surplus < 0:  # Deficit: Drain battery first, buy the rest
+        deficit = load - solar
+        discharge = min(deficit * 5, Estored, P_maxDischarge * Tick_duration)
+        Estored = Estored - discharge
+        P_grid = deficit - (discharge / 5)
+
+    else:
+        P_grid = 0
+
+    return P_grid, Estored
+
+def should_hold_charge(current_tick, expected_prices_array, current_price, E_max,storedF):
     worst_future = -1
     worst_tick = -1
 
 
+
     for t in range(current_tick + 1, TICKS_PER_DAY):
         if expected_prices_array[t] > worst_future:
-            worst_future = expected_prices_array[t]
+            worst_future = expected_prices_array[t]#searching for the worst price
             worst_tick = t
-        if t < TICKS_PER_DAY - 1 and expected_prices_array[t] > expected_prices_array[t + 1]:
+        if t < TICKS_PER_DAY - 1 and expected_prices_array[t] > expected_prices_array[t + 1]:# if you arent at the final value in the day and the price goes down
             break
 
     if worst_tick == -1:
         return False
 
-    expected_surplus = 0
+
     worse_peak_before_trough = False
 
     for i in range(current_tick + 1, worst_tick+1):
-        if expected_prices_array[i] > current_price + 5: # if the expected price beats the current price by 5 then hold
+        if expected_prices_array[i] > current_price + 10: # if the expected price beats the current price by 10 then hold  if the price goes up
             worse_peak_before_trough = True
 
         sun = getSunlight(i) * 0.03
         demand = getBaseDemand(i) * BASE_DEMAND_SCALING
 
-        if sun > demand:
-            expected_surplus = expected_surplus + (sun - demand)
 
-        if expected_prices_array[i] < current_price:
-            if worse_peak_before_trough:
+
+        if expected_prices_array[i] < current_price: # if  the price goes down
+            if worse_peak_before_trough: # if there is then hold
                 return True
             return False
-
-    energy_deficit = E_max - Estored
-    if expected_surplus > energy_deficit:
+    storedF_test = storedF
+    for i in range(current_tick+1, worst_tick+1):
+        sun = getSunlight(i) * 0.03
+        demand = getBaseDemand(i) * BASE_DEMAND_SCALING
+        overall = sun - demand
+        if overall>0:
+            delta = min((overall * Tick_duration) / E_max, charge_Energy, 1.0 - storedF_test)
+            storedF_test += delta
+    if storedF_test>storedF:
         if worse_peak_before_trough:
             return True
         return False
-
     return True
 
 
@@ -146,13 +226,13 @@ def all_3 (price_forecast, deferrable):
 
 def get_next_local_peak(current_tick, prices):
     if current_tick >= len(prices)-1:
-        return prices[-1]
+        return prices[-1],-1
 
     for t in range(current_tick, len(prices) - 1):
         if prices[t] > prices[t + 1]:  #finds the peak
-            return prices[t]
+            return prices[t],t
 
-    return prices[-1]  # no peak then the last one is the peak
+    return prices[-1],-1  # no peak then the last one is the peak
 
 
 def naive_scheduler(deferables):
@@ -180,7 +260,7 @@ def naive_scheduler(deferables):
 
 if __name__ == '__main__':
 
-    Estored = 0
+    storeF = 0
     E_max = 10
     cost =0
     sell_price=0
@@ -192,6 +272,11 @@ if __name__ == '__main__':
     naive_cost = 0
     naive_sell = 0
     ##########################
+
+    # At initialisation:
+    test_Estored = 0
+    test_cost = 0
+    test_sell = 0
 
     try:
         while True :
@@ -215,14 +300,11 @@ if __name__ == '__main__':
                 print("Schedule:", schedule)
 
 
+
             if last_tick != current_tick:
-                demand = api_demand()
-
-                ######################
-
-                demand = demand+ schedule.get(current_tick, 0)
-                naive_demand = demand + naive_schedule.get(current_tick, 0)
-                #####################
+                raw_demand = api_demand()
+                demand = raw_demand + schedule.get(current_tick, 0)
+                naive_demand = raw_demand + naive_schedule.get(current_tick, 0)
 
                 if (current_tick<=58):
                     next_sun = getSunlight(current_tick + 1)
@@ -234,13 +316,26 @@ if __name__ == '__main__':
                     nextprice = BASE_PRICE + (next_demand - next_sun) * PRICE_SOLAR_DEP
 
                 Psolar = solar_power(current_tick)
+                ############################
+                # Inside the tick loop:
+                test_demand = raw_demand + schedule.get(current_tick, 0)  # Same smart schedule
+                test_Pgrid, test_Estored = naive_chooser(Psolar, test_demand, E_max, test_Estored)
 
-                hold_charge_flag = should_hold_charge(current_tick, expected_prices_array,price,Estored, E_max) # why would it need the price without the additiaonal load
-                future_peak = get_next_local_peak(current_tick, expected_prices_array)
-                Pgrid, Estored = chooser(price, hold_charge_flag, Psolar, demand, E_max, Estored,future_peak)
+                if test_Pgrid > 0:
+                    test_cost += test_Pgrid * price
+                else:
+                    test_sell += test_Pgrid * buy_now
+############################
+
+
+
+                hold_charge_flag = should_hold_charge(current_tick, expected_prices_array,price,E_max, storeF) # why would it need the price without the additiaonal load
+                future_peak,future_peak_tick = get_next_local_peak(current_tick, expected_prices_array)
+                Pgrid, storeF = chooser(price, hold_charge_flag, Psolar, demand, E_max, future_peak,storeF)
 
                 if Pgrid > 0:
                     cost = cost + Pgrid*price
+
                 else:
                     sell_price = sell_price + Pgrid*buy_now
                 ################## #- THESE MEAN THAT THEY ARE TEMPORARy
@@ -259,12 +354,16 @@ if __name__ == '__main__':
                     f"\n=== TICK {current_tick:02d} | Solar: {Psolar:.4f} | Base Demand: {demand:.4f} | Price: {price:.2f} ===")
 
                 # Your Bot stats
-                print(f"  [YOUR BOT]   Demand: {demand:.4f} | E_stored: {Estored:.2f} | P&L: {(cost + sell_price):.2f}")
+                print(f"  [YOUR BOT]   Demand: {demand:.4f} | E_stored: {storeF:.2f} | P&L: {(cost + sell_price):.2f}")
 
                 # Naive Bot stats
                 print(
                     f"  [NAIVE BOT]  Demand: {naive_demand:.4f} | E_stored: {naive_Estored:.2f} | P&L: {(naive_cost + naive_sell):.2f}")
+
+                print(
+                    f"  [SCHED ONLY] Demand: {test_demand:.4f} | E_stored: {test_Estored:.2f} | P&L: {(test_cost + test_sell):.2f}")
                 print("-" * 80)  # Draws a separator line
+
             time.sleep(1)
     except KeyboardInterrupt:
         print ("sellFINAL:",sell_price)
