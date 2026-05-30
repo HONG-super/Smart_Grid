@@ -6,13 +6,133 @@
 
 from machine import Pin, I2C, ADC, PWM, Timer
 import utime
+import sys
 
-# Save test results to CSV
-SAVE_RESULTS = True
-RESULTS_FILE = "external_grid_10V_no_mqtt.csv"
-LOG_DURATION_MS = 30000        # record for 30 seconds
-LOG_PERIOD_MS = 10             # write one row every 10 ms
-LOG_FLUSH_PERIOD_MS = 1000     # flush every 1 second
+try:
+    import uselect as select
+except:
+    import select
+
+
+# ============================================================
+# User settings
+# ============================================================
+
+# PID gains. These are the same order as the previous working PID version.
+PP = 150.0
+PI = 300.0
+PD = 0.0
+
+# Target DC bus voltage
+VBUS_REF = 10.00
+
+# Port A = external PSU / grid side
+# Port B = DC bus side
+# Therefore Vbus = Vb.
+BUS_ON_PORT_A = False
+
+# Your previous stable setup used this direction:
+# positive error means Vbus is too low.
+# CONTROL_SIGN = -1 means duty decreases when Vbus is too low.
+CONTROL_SIGN = -1
+
+# Safer default: do not start PWM automatically.
+# Send "S" in serial to start; send "H" to stop; send "R" to clear trip.
+AUTO_START = False
+
+
+# ============================================================
+# Duty / PWM limits
+# ============================================================
+
+PWM_TOP = 65535
+
+DUTY_BASE = 10000
+
+# Keep the same low-side value as before.
+DUTY_MIN = 1000
+
+# Extra safety: do not allow the controller to jump near full duty.
+# If the converter cannot reach 10 V, increase this slowly, e.g. 30000 -> 40000.
+DUTY_MAX = 30000
+
+# Absolute bounds for MicroPython PWM.
+DUTY_ABS_MIN = 0
+DUTY_ABS_MAX = 65535
+
+# Max duty change per PID update. PID updates every 10 ms, so this prevents jumps.
+DUTY_SLEW_STEP = 120
+
+# When unsafe but not yet tripped, move duty back toward base.
+DUTY_RETURN_STEP = 300
+
+# Open-loop Vpot mode is also limited and slewed.
+OPEN_LOOP_SLEW_STEP = 100
+
+
+# ============================================================
+# Timing
+# ============================================================
+
+# Main loop timer runs at 1 kHz.
+# PID updates every 10 timer ticks = 10 ms.
+PID_PERIOD = 10
+pid_count = 0
+
+# Integral anti-windup limit, units approximately V*s.
+ERR_INT_LIMIT = 5.0
+
+
+# ============================================================
+# Safety limits
+# ============================================================
+
+# Hard trips. PWM is immediately turned off.
+VBUS_OV_TRIP = 11.50
+VBUS_UV_TRIP = 6.00
+
+# Extra Port-A protection, because Port A is the external 12 V PSU side.
+VA_OV_TRIP = 13.20
+
+# Current limits.
+# Soft limit: reduce duty and reset integrator.
+# Trip limit: PWM off and latch trip.
+IL_SOFT_LIMIT = 0.55
+IL_TRIP = 0.80
+
+# Sensor sanity limits.
+# If ADC calculation produces impossible values, stop.
+V_SENSOR_MIN = -0.20
+V_SENSOR_MAX = 16.00
+
+# If current sensor returns a huge impossible spike, trip.
+IL_SENSOR_MAX = 3.00
+
+
+# ============================================================
+# CSV logging
+# ============================================================
+
+LOG_ENABLE = True
+LOG_PERIOD_MS = 10
+LOG_DURATION_MS = 30000
+LOG_FLUSH_PERIOD_MS = 1000
+
+PRINT_PERIOD_COUNT = 1000
+
+
+def make_filename(pp, pi, pd, vref):
+    pp_s = str(pp).replace(".", "p")
+    pi_s = str(pi).replace(".", "p")
+    pd_s = str(pd).replace(".", "p")
+    vref_s = str(vref).replace(".", "p")
+    return "grid_safe_vref{}_pp{}_pi{}_pd{}.csv".format(
+        vref_s, pp_s, pi_s, pd_s
+    )
+
+
+LOG_FILE_NAME = make_filename(PP, PI, PD, VBUS_REF)
+
 
 # ============================================================
 # Hardware setup
@@ -20,63 +140,205 @@ LOG_FLUSH_PERIOD_MS = 1000     # flush every 1 second
 
 va_pin = ADC(Pin(28))
 vb_pin = ADC(Pin(26))
+vpot_pin = ADC(Pin(27))
+
+# Physical switches kept from previous version
+OL_CL_pin = Pin(12, Pin.IN, Pin.PULL_UP)
+BU_BO_pin = Pin(2, Pin.IN, Pin.PULL_UP)
 
 ina_i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=2400000)
 
 pwm = PWM(Pin(9))
 pwm.freq(100000)
+pwm.duty_u16(0)
 
-min_pwm = 1000
-max_pwm = 64536
-pwm_out = min_pwm
+led = Pin("LED", Pin.OUT)
+led.on()
+
 
 # ============================================================
-# Controller settings
+# State variables
 # ============================================================
 
-kp = 100
-ki = 200
-
-# Changed from 7.05 V to 10.00 V
-v_ref = 10.00
-
-v_err = 0.0
-v_err_int = 0.0
-v_pi_out = 0.0
-
-# Integral limit
-V_ERR_INT_LIMIT = 10000
-
-# Shunt resistance
 SHUNT_OHMS = 0.10
 
-# Timer variables
 timer_elapsed = 0
 count = 0
 first_run = 1
 
+run_enable = AUTO_START
+trip = False
+trip_reason = ""
+OC = 0
+
+# Controller variables
+v_err = 0.0
+v_err_prev = 0.0
+v_err_int = 0.0
+v_err_der = 0.0
+pid_out = 0.0
+
+duty_pid = DUTY_BASE
+duty = 0
+pwm_ref = DUTY_BASE
+
+# Filtered values
+IL_FILTER_ALPHA = 0.25
+VBUS_FILTER_ALPHA = 0.25
+iL_filt = 0.0
+vbus_filt = 0.0
+filter_init = False
+
+# Potentiometer filter for open-loop debug mode
+v_pot_filt = [0.0] * 100
+v_pot_index = 0
+
 # Logging variables
-results = None
+log_file = None
 log_start_ms = 0
 last_log_ms = 0
 last_flush_ms = 0
 log_done = False
 
+# Serial command
+command = ""
+
+
 # ============================================================
 # Helper functions
 # ============================================================
 
-def saturate(signal, upper, lower):
-    if signal > upper:
-        signal = upper
-    if signal < lower:
-        signal = lower
-    return signal
+def clamp(value, lower, upper):
+    if value > upper:
+        return upper
+    if value < lower:
+        return lower
+    return value
+
+
+def slew(current, target, step):
+    if target > current + step:
+        return current + step
+    if target < current - step:
+        return current - step
+    return target
 
 
 def tick(t):
     global timer_elapsed
     timer_elapsed = 1
+
+
+def pwm_write_safe(value):
+    global duty
+
+    duty = int(clamp(value, DUTY_ABS_MIN, DUTY_ABS_MAX))
+    pwm.duty_u16(duty)
+
+
+def pwm_off():
+    global duty, duty_pid
+
+    duty = 0
+    duty_pid = DUTY_BASE
+    pwm.duty_u16(0)
+
+
+def reset_controller():
+    global v_err, v_err_prev, v_err_int, v_err_der, pid_out
+    global pid_count, duty_pid
+
+    v_err = 0.0
+    v_err_prev = 0.0
+    v_err_int = 0.0
+    v_err_der = 0.0
+    pid_out = 0.0
+    pid_count = 0
+    duty_pid = DUTY_BASE
+
+
+def do_trip(reason):
+    global trip, trip_reason, run_enable, OC
+
+    if not trip:
+        print("TRIP:", reason)
+
+    trip = True
+    trip_reason = reason
+    run_enable = False
+    OC = 1
+    reset_controller()
+    pwm_off()
+
+
+def do_stop():
+    global trip, trip_reason, run_enable, OC
+
+    run_enable = False
+    trip = False
+    trip_reason = ""
+    OC = 0
+    reset_controller()
+    pwm_off()
+    print("STOPPED. Send S to start.")
+
+
+def do_start(vbus_now):
+    global run_enable, trip, trip_reason, duty_pid, duty
+
+    if trip:
+        print("Cannot start: trip is still active. Send R first.")
+        return
+
+    if vbus_now > VBUS_OV_TRIP or vbus_now < VBUS_UV_TRIP:
+        print("Cannot start: Vbus unsafe = {:.3f} V".format(vbus_now))
+        return
+
+    reset_controller()
+    duty_pid = DUTY_BASE
+    duty = DUTY_BASE
+    pwm_write_safe(duty)
+    run_enable = True
+    print("STARTED at DUTY_BASE =", DUTY_BASE)
+
+
+def read_cmd():
+    global command
+
+    try:
+        if poll.poll(0):
+            line = sys.stdin.readline().strip().upper()
+            if line:
+                command = line[0]
+    except:
+        pass
+
+
+def print_status(va, vb, vbus, iL, CL, BU, vpot):
+    mode = "RUN" if run_enable else "STOP"
+    if trip:
+        mode = "TRIP"
+
+    print("mode =", mode)
+    print("Va = {:.3f} V".format(va))
+    print("Vb = {:.3f} V".format(vb))
+    print("Vbus = {:.3f} V".format(vbus))
+    print("Vref = {:.3f} V".format(VBUS_REF))
+    print("iL = {:.3f} A".format(iL))
+    print("OC =", OC)
+    print("CL =", CL)
+    print("BU =", BU)
+    print("Vpot = {:.3f} V".format(vpot))
+    print("duty = {:d}".format(int(duty)))
+    print("duty_pid = {:d}".format(int(duty_pid)))
+    print("v_err = {:.4f}".format(v_err))
+    print("v_err_int = {:.4f}".format(v_err_int))
+    print("v_err_der = {:.4f}".format(v_err_der))
+    print("pid_out = {:.3f}".format(pid_out))
+    print("log_done =", log_done)
+    if trip:
+        print("trip_reason =", trip_reason)
+    print("----------------------")
 
 
 # ============================================================
@@ -97,7 +359,12 @@ class ina219:
         self.shunt = sr
 
     def vshunt(self):
-        reg_bytes = ina_i2c.readfrom_mem(self.address, self.REG_SHUNTVOLTAGE, 2)
+        reg_bytes = ina_i2c.readfrom_mem(
+            self.address,
+            self.REG_SHUNTVOLTAGE,
+            2
+        )
+
         reg_value = int.from_bytes(reg_bytes, "big")
 
         # Signed 16-bit conversion
@@ -108,7 +375,12 @@ class ina219:
         return float(reg_value) * 1e-5
 
     def vbus(self):
-        reg_bytes = ina_i2c.readfrom_mem(self.address, self.REG_BUSVOLTAGE, 2)
+        reg_bytes = ina_i2c.readfrom_mem(
+            self.address,
+            self.REG_BUSVOLTAGE,
+            2
+        )
+
         reg_value = int.from_bytes(reg_bytes, "big") >> 3
         return float(reg_value) * 0.004
 
@@ -121,6 +393,14 @@ class ina219:
 
 
 # ============================================================
+# Serial polling setup
+# ============================================================
+
+poll = select.poll()
+poll.register(sys.stdin, select.POLLIN)
+
+
+# ============================================================
 # Main loop
 # ============================================================
 
@@ -130,13 +410,14 @@ while True:
         ina = ina219(SHUNT_OHMS, 64, 5)
         ina.configure()
 
-        if SAVE_RESULTS:
-            results = open(RESULTS_FILE, "w")
-            results.write(
-                "time_ms,Va,Vb,iL,power,import_power,export_power,"
-                "duty,pwm_out,v_ref,v_err,v_err_int,v_pi_out\n"
+        if LOG_ENABLE:
+            log_file = open(LOG_FILE_NAME, "w")
+            log_file.write(
+                "time_ms,Va,Vb,Vbus,Vref,iL,iL_filt,power,"
+                "duty,duty_pid,pid_out,v_err,v_err_int,v_err_der,"
+                "OC,trip,run_enable,CL,BU,Vpot,trip_reason\n"
             )
-            results.flush()
+            log_file.flush()
 
         log_start_ms = utime.ticks_ms()
         last_log_ms = log_start_ms
@@ -147,118 +428,321 @@ while True:
         loop_timer = Timer(mode=Timer.PERIODIC, freq=1000, callback=tick)
 
         print("================================")
-        print("RUNNING EXTERNAL GRID CODE WITHOUT WIFI/MQTT")
-        print("CSV logging =", SAVE_RESULTS)
-        print("CSV file =", RESULTS_FILE)
-        print("LOG_DURATION_MS =", LOG_DURATION_MS)
-        print("Target Vb v_ref =", v_ref)
-        print("kp =", kp)
-        print("ki =", ki)
+        print("RESTORED SAFE GRID PID CODE")
+        print("Commands: S=start, H=stop, R=clear trip, P=print")
+        print("AUTO_START =", AUTO_START)
+        print("VBUS_REF =", VBUS_REF)
+        print("PP =", PP, "PI =", PI, "PD =", PD)
+        print("CONTROL_SIGN =", CONTROL_SIGN)
+        print("DUTY_BASE =", DUTY_BASE)
+        print("DUTY_MIN =", DUTY_MIN)
+        print("DUTY_MAX =", DUTY_MAX)
+        print("IL_SOFT_LIMIT =", IL_SOFT_LIMIT)
+        print("IL_TRIP =", IL_TRIP)
+        print("LOG_FILE_NAME =", LOG_FILE_NAME)
         print("================================")
 
     if timer_elapsed == 1:
+
+        timer_elapsed = 0
 
         # ------------------------------------------------------------
         # Measurements
         # ------------------------------------------------------------
 
-        va = 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
-        vb = 1.015 * (12490 / 2490) * 3.3 * (vb_pin.read_u16() / 65536)
+        try:
+            va = 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
 
-        Vshunt = ina.vshunt()
-        iL = Vshunt / SHUNT_OHMS
+            # If Pico Vb reads high compared with multimeter,
+            # tune this factor. Example: 1.015 -> 0.999.
+            vb = 1.015 * (12490 / 2490) * 3.3 * (vb_pin.read_u16() / 65536)
 
-        power = vb * iL
+            vpot_in = 1.026 * 3.3 * (vpot_pin.read_u16() / 65536)
 
-        if power < 0:
-            export_power = -power
-            import_power = 0
+            v_pot_filt[v_pot_index] = vpot_in
+            v_pot_index = v_pot_index + 1
+
+            if v_pot_index == 100:
+                v_pot_index = 0
+
+            vpot = sum(v_pot_filt) / 100.0
+
+            Vshunt = ina.vshunt()
+            iL = Vshunt / SHUNT_OHMS
+
+        except Exception as e:
+            do_trip("sensor read error: " + str(e))
+            continue
+
+        CL = OL_CL_pin.value()
+        BU = BU_BO_pin.value()
+
+        if BUS_ON_PORT_A:
+            vbus_raw = va
         else:
-            export_power = 0
-            import_power = power
+            vbus_raw = vb
+
+        if not filter_init:
+            iL_filt = iL
+            vbus_filt = vbus_raw
+            filter_init = True
+        else:
+            iL_filt = (1.0 - IL_FILTER_ALPHA) * iL_filt + IL_FILTER_ALPHA * iL
+            vbus_filt = (1.0 - VBUS_FILTER_ALPHA) * vbus_filt + VBUS_FILTER_ALPHA * vbus_raw
+
+        vbus = vbus_filt
+        power = vbus * iL
 
         # ------------------------------------------------------------
-        # PI voltage controller
+        # Serial commands
         # ------------------------------------------------------------
 
-        v_err = v_ref - vb
+        read_cmd()
 
-        v_err_int = v_err_int + v_err
-        v_err_int = saturate(v_err_int, V_ERR_INT_LIMIT, -V_ERR_INT_LIMIT)
+        if command == "H":
+            do_stop()
+            command = ""
 
-        v_pi_out = (kp * v_err) + (ki * v_err_int)
+        elif command == "R":
+            trip = False
+            trip_reason = ""
+            OC = 0
+            reset_controller()
+            pwm_off()
+            run_enable = False
+            print("Trip cleared. PWM is OFF. Send S to start.")
+            command = ""
 
-        min_pwm = 0
-        max_pwm = 64536
+        elif command == "S":
+            do_start(vbus)
+            command = ""
 
-        pwm_out = saturate(v_pi_out, max_pwm, min_pwm)
+        elif command == "P":
+            print_status(va, vb, vbus, iL, CL, BU, vpot)
+            command = ""
 
-        # Original code uses inverted PWM
-        duty = int(65536 - pwm_out)
+        # ------------------------------------------------------------
+        # Safety checks
+        # ------------------------------------------------------------
 
-        pwm.duty_u16(duty)
+        # Sensor sanity check
+        if (
+            va < V_SENSOR_MIN
+            or vb < V_SENSOR_MIN
+            or va > V_SENSOR_MAX
+            or vb > V_SENSOR_MAX
+            or abs(iL) > IL_SENSOR_MAX
+        ):
+            do_trip("sensor value impossible")
+            continue
+
+        # Hard trips only matter when PWM is active.
+        if run_enable and (not trip):
+
+            if abs(iL) >= IL_TRIP:
+                do_trip("overcurrent {:.3f} A".format(iL))
+                continue
+
+            if vbus >= VBUS_OV_TRIP:
+                do_trip("Vbus overvoltage {:.3f} V".format(vbus))
+                continue
+
+            if vbus <= VBUS_UV_TRIP:
+                do_trip("Vbus undervoltage {:.3f} V".format(vbus))
+                continue
+
+            if va >= VA_OV_TRIP:
+                do_trip("Port A overvoltage {:.3f} V".format(va))
+                continue
+
+        # ------------------------------------------------------------
+        # Control
+        # ------------------------------------------------------------
+
+        if trip or (not run_enable):
+
+            pwm_off()
+
+        else:
+
+            # Convert potentiometer to PWM reference for open-loop debug mode.
+            pwm_ref = int(clamp(
+                PWM_TOP - int((vpot / 3.3) * PWM_TOP),
+                DUTY_MIN,
+                DUTY_MAX
+            ))
+
+            # ========================================================
+            # Open-loop debug mode
+            # CL switch not active: Vpot controls duty, but with limits.
+            # ========================================================
+            if CL != 1:
+
+                v_err_int = 0.0
+                v_err_prev = 0.0
+                v_err_der = 0.0
+                pid_out = 0.0
+
+                if abs(iL) >= IL_SOFT_LIMIT:
+                    OC = 1
+                    target = DUTY_BASE
+                else:
+                    OC = 0
+                    target = pwm_ref
+
+                duty_pid = slew(duty_pid, target, OPEN_LOOP_SLEW_STEP)
+                duty_pid = clamp(duty_pid, DUTY_MIN, DUTY_MAX)
+                pwm_write_safe(duty_pid)
+
+            # ========================================================
+            # Closed-loop voltage PID mode
+            # CL switch active: regulate Vbus around VBUS_REF.
+            # ========================================================
+            else:
+
+                pid_count = pid_count + 1
+
+                if pid_count >= PID_PERIOD:
+                    pid_count = 0
+
+                    dt = PID_PERIOD / 1000.0
+
+                    # positive error means Vbus is too low
+                    v_err = VBUS_REF - vbus
+
+                    # Soft protection: do not trip yet, but pull back.
+                    if abs(iL) >= IL_SOFT_LIMIT:
+                        OC = 1
+
+                        v_err_int = 0.0
+                        v_err_der = 0.0
+
+                        duty_pid = slew(
+                            duty_pid,
+                            DUTY_BASE,
+                            DUTY_RETURN_STEP
+                        )
+
+                    else:
+                        OC = 0
+
+                        # Derivative
+                        v_err_der = (v_err - v_err_prev) / dt
+                        v_err_prev = v_err
+
+                        # Candidate integral update
+                        new_int = clamp(
+                            v_err_int + v_err * dt,
+                            -ERR_INT_LIMIT,
+                            ERR_INT_LIMIT
+                        )
+
+                        # PID using candidate integral
+                        candidate_pid = (
+                            PP * v_err
+                            + PI * new_int
+                            + PD * v_err_der
+                        )
+
+                        candidate_target = (
+                            DUTY_BASE
+                            + CONTROL_SIGN * candidate_pid
+                        )
+
+                        candidate_target = clamp(
+                            candidate_target,
+                            DUTY_MIN,
+                            DUTY_MAX
+                        )
+
+                        # Anti-windup:
+                        # only accept the new integral if output is not
+                        # stuck at a limit, or if the error drives it back.
+                        at_upper = candidate_target >= DUTY_MAX
+                        at_lower = candidate_target <= DUTY_MIN
+
+                        if not at_upper and not at_lower:
+                            v_err_int = new_int
+                        else:
+                            # keep integral frozen at the limit
+                            pass
+
+                        pid_out = (
+                            PP * v_err
+                            + PI * v_err_int
+                            + PD * v_err_der
+                        )
+
+                        target = DUTY_BASE + CONTROL_SIGN * pid_out
+                        target = clamp(target, DUTY_MIN, DUTY_MAX)
+
+                        duty_pid = slew(
+                            duty_pid,
+                            target,
+                            DUTY_SLEW_STEP
+                        )
+
+                duty_pid = clamp(duty_pid, DUTY_MIN, DUTY_MAX)
+                pwm_write_safe(duty_pid)
 
         # ------------------------------------------------------------
         # CSV logging
         # ------------------------------------------------------------
 
-        if SAVE_RESULTS and (not log_done):
+        if LOG_ENABLE and (not log_done):
             now_ms = utime.ticks_ms()
             elapsed_ms = utime.ticks_diff(now_ms, log_start_ms)
 
             if utime.ticks_diff(now_ms, last_log_ms) >= LOG_PERIOD_MS:
                 last_log_ms = now_ms
 
-                results.write(
-                    "{},{:.3f},{:.3f},{:.4f},{:.4f},{:.4f},{:.4f},"
-                    "{},{:.3f},{:.3f},{:.4f},{:.4f},{:.3f}\n".format(
+                # Avoid commas in trip_reason field
+                safe_reason = trip_reason.replace(",", ";")
+
+                log_file.write(
+                    "{},{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.4f},{:.4f},"
+                    "{},{},{:.3f},{:.4f},{:.4f},{:.4f},"
+                    "{},{},{},{},{},{:.3f},{}\n".format(
                         elapsed_ms,
                         va,
                         vb,
+                        vbus,
+                        VBUS_REF,
                         iL,
+                        iL_filt,
                         power,
-                        import_power,
-                        export_power,
-                        duty,
-                        pwm_out,
-                        v_ref,
+                        int(duty),
+                        int(duty_pid),
+                        pid_out,
                         v_err,
                         v_err_int,
-                        v_pi_out
+                        v_err_der,
+                        OC,
+                        int(trip),
+                        int(run_enable),
+                        CL,
+                        BU,
+                        vpot,
+                        safe_reason
                     )
                 )
 
             if utime.ticks_diff(now_ms, last_flush_ms) >= LOG_FLUSH_PERIOD_MS:
                 last_flush_ms = now_ms
-                results.flush()
+                log_file.flush()
 
             if elapsed_ms >= LOG_DURATION_MS:
-                results.flush()
-                results.close()
+                log_file.flush()
+                log_file.close()
                 log_done = True
-                print("CSV logging finished. File saved as:", RESULTS_FILE)
+                print("CSV logging finished. File saved as:", LOG_FILE_NAME)
 
         # ------------------------------------------------------------
         # Slow serial print
         # ------------------------------------------------------------
 
         count = count + 1
-        timer_elapsed = 0
 
-        if count > 1000:
+        if count > PRINT_PERIOD_COUNT:
+            print_status(va, vb, vbus, iL, CL, BU, vpot)
             count = 0
-
-            print("Va = {:.3f}".format(va))
-            print("Vb = {:.3f}".format(vb))
-            print("iL = {:.3f}".format(iL))
-            print("Power = {:.3f}".format(power))
-            print("Import power = {:.3f}".format(import_power))
-            print("Export power = {:.3f}".format(export_power))
-            print("v_ref = {:.3f}".format(v_ref))
-            print("v_err = {:.4f}".format(v_err))
-            print("v_err_int = {:.4f}".format(v_err_int))
-            print("v_pi_out = {:.3f}".format(v_pi_out))
-            print("pwm_out = {:.3f}".format(pwm_out))
-            print("duty cycle = {:d}".format(duty))
-            print("logging_done =", log_done)
-            print("----------------------")
