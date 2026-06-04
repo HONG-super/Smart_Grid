@@ -90,7 +90,6 @@ controller_grn = PID(0.01, 2, 0, setpoint=1, scale="ms")
 count = 0
 start_time = time.ticks_ms()
 power_num = 0
-count1 = 0
 channel_target = 0
 
 
@@ -116,13 +115,18 @@ try:
             count1 += 1
             prev_request = 3*channel_target
             
-            if prev_request != min(p_target, 3):
+            if prev_request != max(min(p_target, 3),0):
                 print ( str(prev_request)+"->"+str(p_target))
-                prev_request = min(p_target,3)
-                channel_target = p_target/3
+                prev_request = max(min(p_target,3),0)
+                channel_target = max(p_target/3,0)
                 controller_red.setpoint = min(channel_target,1)
                 controller_yel.setpoint = min(channel_target,1)
                 controller_grn.setpoint = min(channel_target,1)
+                p_sum = 0
+                p_sum_red = 0
+                p_sum_yel = 0
+                p_sum_grn = 0
+                
             
             ired_pin = 2.497 * (readadc(4) / 4096)
             iyel_pin = 2.497 * (readadc(2) / 4096)
