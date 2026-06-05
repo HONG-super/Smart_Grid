@@ -61,7 +61,7 @@ C          = 0.5
 SHUNT_OHMS = 0.10
 dt         = 1 / 1000.0
 
-VCAP_MIN = 10.5
+VCAP_MIN = 10.0
 VCAP_MAX = 16.0
 
 # STORE is allowed slightly below the normal operating minimum during testing,
@@ -104,8 +104,8 @@ CSV_LOG_INTERVAL_MS = 50     # one row every 50 ms = about 800 rows
 # and control delay mean we use a higher current target. Watch board temperature.
 I_STORE    =  0.70          # Faster but safer store current target, A
 I_EXTRACT  = -0.70          # Safer extract current target, A
-I_MAINTAIN =  0.03           # Maintain current target, A
-I_LIMIT    =  1.20          # Hard overcurrent trip limit, A
+I_MAINTAIN =  0.02           # Maintain current target, A
+I_LIMIT    =  1.0          # Hard overcurrent trip limit, A
 
 
 # ============================================================
