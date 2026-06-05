@@ -2,7 +2,7 @@
 # Hardware: 0.5 F cap, Vbus = 10.0 V
 # WARNING: this is a test version with opened STORE PWM ceiling. Use PSU current limit.
 # Commands: S=store  E=extract  U=maintain  H=stop  P=print  C=40s CSV log
-# Version: v21 15J STORE/EXTRACT + smooth MAINTAIN handover
+# Version: v22 15J STORE/EXTRACT + faster high-voltage STORE ramp
 # Main changes:
 # 1) Raise high-voltage STORE ceiling to 15000 because 14000 still limited current near 12 V.
 # 2) Use voltage-based SAFE_HOLD / recovery so EXTRACT handover does not keep discharging.
@@ -11,6 +11,7 @@
 # 5) Reduce EXTRACT end overcurrent by braking earlier and switching back more smoothly.
 # 6) v20: stronger final EXTRACT braking after the 1.207 A end spike test.
 # 7) v21: EXTRACT -> MAINTAIN no longer jumps straight to high hold PWM.
+# 8) v22: faster STORE PWM ramp above 12.5 V / 13.8 V to improve high-voltage charging speed.
 
 from machine import Pin, I2C, ADC, PWM, Timer
 import time
@@ -100,7 +101,7 @@ CSV_LOG_INTERVAL_MS = 50     # one row every 50 ms = about 800 rows
 # roughly 0.20-0.30 A ideal capacitor current, but practical SMPS loss and
 # control delay mean we use a higher current target. Watch board temperature.
 I_STORE    =  0.70          # Faster but safer store current target, A
-I_EXTRACT  = -0.65          # Safer extract current target, A
+I_EXTRACT  = -0.70          # Safer extract current target, A
 I_MAINTAIN =  0.03           # Maintain current target, A
 I_LIMIT    =  1.20          # Hard overcurrent trip limit, A
 
@@ -136,9 +137,13 @@ STORE_HIGH_VCAP = 10.4
 # Incremental proportional controller for STORE mode.
 # This version ramps upward faster to reach the 15 J target sooner.
 # Downward motion is still faster for safety.
-STORE_PWM_GAIN = 180.0
-STORE_PWM_MAX_STEP_UP = 25.0
-STORE_PWM_MAX_STEP_DOWN = 300.0
+STORE_PWM_GAIN = 200.0
+STORE_PWM_MAX_STEP_UP = 25.0       # Base ramp-up below 12.5 V
+STORE_PWM_MAX_STEP_UP_MID = 35.0   # Faster ramp-up from 12.5 V
+STORE_PWM_MAX_STEP_UP_HIGH = 45.0  # Fastest ramp-up from 13.8 V
+STORE_PWM_STEP_MID_VCAP = 12.5
+STORE_PWM_STEP_HIGH_VCAP = 13.8
+STORE_PWM_MAX_STEP_DOWN = 320.0
 
 # MAINTAIN is deliberately protected.
 # Latest log: after STORE finished at about Vcap=12.4 V, MAINTAIN
@@ -380,6 +385,24 @@ def get_store_pwm_hard_max(vcap):
         return STORE_PWM_HARD_MAX_HIGH
 
     return STORE_PWM_HARD_MAX_BASE
+
+
+def get_store_pwm_step_up(vcap):
+    """
+    STORE ramp-up speed.
+
+    Low voltage already reached 15 J in about 5 s, so keep the old base ramp.
+    High voltage STORE was slower because PWM had to climb from about 23k to
+    25k+ while current stayed slightly below target, so allow faster upward
+    PWM movement only at higher Vcap.
+    """
+    if vcap >= STORE_PWM_STEP_HIGH_VCAP:
+        return STORE_PWM_MAX_STEP_UP_HIGH
+
+    if vcap >= STORE_PWM_STEP_MID_VCAP:
+        return STORE_PWM_MAX_STEP_UP_MID
+
+    return STORE_PWM_MAX_STEP_UP
 
 
 def calculate_store_warm_start_pwm(vcap):
@@ -1015,7 +1038,7 @@ print(
     )
 )
 print(
-    "OPEN LIMIT TEST: STORE cold start low={} mid={} high={} using Vcap-Vbus thresholds {:.2f}V/{:.2f}V; hard_max_base={} hard_max_high={} high_from={:.2f}V; ramp_up={} count/ms; overcurrent->SAFE_HOLD; MAINTAIN base min PWM={}; stopped-current block={:.3f}A; EXTRACT floor=9.0V -> V_HOLD".format(
+    "OPEN LIMIT TEST: STORE cold start low={} mid={} high={} using Vcap-Vbus thresholds {:.2f}V/{:.2f}V; hard_max_base={} hard_max_high={} high_from={:.2f}V; ramp_up_high={} count/ms; overcurrent->SAFE_HOLD; MAINTAIN base min PWM={}; stopped-current block={:.3f}A; EXTRACT floor=9.0V -> V_HOLD".format(
         STORE_SAFE_START_PWM,
         STORE_COLD_MID_PWM,
         STORE_COLD_HIGH_PWM,
@@ -1024,7 +1047,7 @@ print(
         STORE_PWM_HARD_MAX_BASE,
         STORE_PWM_HARD_MAX_HIGH,
         STORE_HIGH_VCAP,
-        STORE_PWM_MAX_STEP_UP,
+        STORE_PWM_MAX_STEP_UP_HIGH,
         MAINTAIN_PWM_MIN,
         STOPPED_CURRENT_BLOCK_STORE
     )
@@ -1446,7 +1469,7 @@ while True:
                 pwm_step = clamp(
                     raw_step,
                     0.0,
-                    STORE_PWM_MAX_STEP_UP
+                    get_store_pwm_step_up(va)
                 )
             else:
                 pwm_step = clamp(
