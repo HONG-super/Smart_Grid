@@ -2,7 +2,7 @@
 # Hardware: 0.5 F cap, Vbus = 10.0 V
 # WARNING: this is a test version with opened STORE PWM ceiling. Use PSU current limit.
 # Commands: S[J]=store  E[J]=extract  U=maintain  H=stop  P=print  C=40s CSV log
-# Version: v21 selectable STORE/EXTRACT energy + 36J software capacity
+# Version: v23 selectable STORE/EXTRACT energy + slower status output
 # Main changes:
 # 1) Raise high-voltage STORE ceiling to 15000 because 14000 still limited current near 12 V.
 # 2) Use voltage-based SAFE_HOLD / recovery so EXTRACT handover does not keep discharging.
@@ -10,6 +10,9 @@
 # 4) Allow direct S start from STOPPED/TRIPPED when current is already safe.
 # 5) Reduce EXTRACT end overcurrent by braking earlier and switching back more smoothly.
 # 6) v20: stronger final EXTRACT braking after the 1.207 A end spike test.
+# 7) v21: EXTRACT -> MAINTAIN no longer jumps straight to high hold PWM.
+# 8) v22: faster STORE PWM ramp above 12.5 V / 13.8 V to improve high-voltage charging speed.
+# 9) v23: status auto-print reduced to 1 Hz to reduce serial load.
 
 from machine import Pin, I2C, ADC, PWM, Timer
 import time
@@ -58,8 +61,8 @@ C          = 0.5
 SHUNT_OHMS = 0.10
 dt         = 1 / 1000.0
 
-VCAP_MIN = 10
-VCAP_MAX = 12.0
+VCAP_MIN = 10.5
+VCAP_MAX = 16.0
 
 # STORE is allowed slightly below the normal operating minimum during testing,
 # but a reading around 4-5 V is treated as a wiring/sensing fault for this setup.
@@ -75,7 +78,7 @@ STOPPED_WARNING_INTERVAL_MS = 1000
 STATUS_PRINT_INTERVAL_MS = 1000
 
 E_MIN = 0.5 * C * VCAP_MIN ** 2
-E_MAX = 36.0                  # Software capacity limit, J. 0.5F at 12V = 36J.
+E_MAX = 0.5 * C * VCAP_MAX ** 2
 
 E_STEP = 15.0                 # Default energy when S/E has no number, J
 STORE_TIME_MS = 5000         # Store target time: 5 seconds
@@ -96,11 +99,11 @@ CSV_LOG_INTERVAL_MS = 50     # one row every 50 ms = about 800 rows
 # Current Settings
 # ============================================================
 
-# For the default +15 J in 5 s, required power is 3 W. Around 10-12 V this
-# means roughly 0.25-0.30 A ideal capacitor current, but practical SMPS loss
+# For the default +15 J in 5 s, required power is 3 W. Around 10.5-16 V this
+# means roughly 0.19-0.29 A ideal capacitor current, but practical SMPS loss
 # and control delay mean we use a higher current target. Watch board temperature.
 I_STORE    =  0.70          # Faster but safer store current target, A
-I_EXTRACT  = -0.65          # Safer extract current target, A
+I_EXTRACT  = -0.70          # Safer extract current target, A
 I_MAINTAIN =  0.03           # Maintain current target, A
 I_LIMIT    =  1.20          # Hard overcurrent trip limit, A
 
@@ -134,11 +137,15 @@ STORE_PWM_HARD_MAX_HIGH = 30000
 STORE_HIGH_VCAP = 10.4
 
 # Incremental proportional controller for STORE mode.
-# This version ramps upward faster to reach the selected energy target sooner.
+# This version ramps upward faster to reach the 15 J target sooner.
 # Downward motion is still faster for safety.
-STORE_PWM_GAIN = 180.0
-STORE_PWM_MAX_STEP_UP = 25.0
-STORE_PWM_MAX_STEP_DOWN = 300.0
+STORE_PWM_GAIN = 200.0
+STORE_PWM_MAX_STEP_UP = 25.0       # Base ramp-up below 12.5 V
+STORE_PWM_MAX_STEP_UP_MID = 35.0   # Faster ramp-up from 12.5 V
+STORE_PWM_MAX_STEP_UP_HIGH = 45.0  # Fastest ramp-up from 13.8 V
+STORE_PWM_STEP_MID_VCAP = 12.5
+STORE_PWM_STEP_HIGH_VCAP = 13.8
+STORE_PWM_MAX_STEP_DOWN = 320.0
 
 # MAINTAIN is deliberately protected.
 # Latest log: after STORE finished at about Vcap=12.4 V, MAINTAIN
@@ -166,7 +173,9 @@ I_SAFE_HOLD = 0.04
 # a PWM could keep a large negative current flowing and over-discharge the cap.
 # Therefore EXTRACT slows down near the energy target and jumps to a safer
 # hold PWM before entering MAINTAIN.
-EXTRACT_EXIT_HOLD_PWM = 14500
+EXTRACT_EXIT_HOLD_PWM = 14500       # Upper target only; do not jump to it directly after EXTRACT
+EXTRACT_EXIT_PWM_STEP = 300         # First handover step from final EXTRACT PWM
+MAINTAIN_SOFT_RAMP_MS = 1400        # Time to ramp MAINTAIN minimum upward after EXTRACT
 EXTRACT_BRAKE_1_J = 1.30
 EXTRACT_BRAKE_2_J = 0.65
 EXTRACT_BRAKE_3_J = 0.25
@@ -234,6 +243,10 @@ action_in_progress = False
 action_start_ms = 0
 store_deadline_reported = False
 extract_return_pwm = 0
+maintain_soft_active = False
+maintain_soft_start_pwm = 0
+maintain_soft_target_pwm = 0
+maintain_soft_start_ms = 0
 
 mode = "STOPPED"
 command = ""
@@ -376,6 +389,24 @@ def get_store_pwm_hard_max(vcap):
         return STORE_PWM_HARD_MAX_HIGH
 
     return STORE_PWM_HARD_MAX_BASE
+
+
+def get_store_pwm_step_up(vcap):
+    """
+    STORE ramp-up speed.
+
+    Low voltage already reached 15 J in about 5 s, so keep the old base ramp.
+    High voltage STORE was slower because PWM had to climb from about 23k to
+    25k+ while current stayed slightly below target, so allow faster upward
+    PWM movement only at higher Vcap.
+    """
+    if vcap >= STORE_PWM_STEP_HIGH_VCAP:
+        return STORE_PWM_MAX_STEP_UP_HIGH
+
+    if vcap >= STORE_PWM_STEP_MID_VCAP:
+        return STORE_PWM_MAX_STEP_UP_MID
+
+    return STORE_PWM_MAX_STEP_UP
 
 
 def calculate_store_warm_start_pwm(vcap):
@@ -630,11 +661,45 @@ def calculate_safe_recovery_pwm(va):
 
 def calculate_maintain_min_pwm(va):
     """
-    Keep MAINTAIN away from the low-duty reverse-current region.
+    Keep normal MAINTAIN away from the low-duty reverse-current region.
     The minimum is raised when Vcap is high.
     """
     safe_pwm = calculate_safe_recovery_pwm(va) - 2500
     return int(clamp(safe_pwm, MAINTAIN_PWM_MIN, 23000))
+
+
+def calculate_active_maintain_min_pwm(va):
+    """
+    Normal MAINTAIN needs a high minimum PWM at high Vcap, but jumping
+    directly to that minimum right after EXTRACT caused a positive current
+    spike. During the short handover period, ramp the minimum upward instead.
+    """
+    global maintain_soft_active
+
+    normal_min = calculate_maintain_min_pwm(va)
+
+    if not maintain_soft_active:
+        return normal_min
+
+    elapsed_ms = time.ticks_diff(time.ticks_ms(), maintain_soft_start_ms)
+
+    if elapsed_ms >= MAINTAIN_SOFT_RAMP_MS:
+        maintain_soft_active = False
+        return normal_min
+
+    if maintain_soft_target_pwm <= maintain_soft_start_pwm:
+        return normal_min
+
+    ramp_pwm = maintain_soft_start_pwm + (
+        (maintain_soft_target_pwm - maintain_soft_start_pwm)
+        * elapsed_ms
+        / MAINTAIN_SOFT_RAMP_MS
+    )
+
+    if ramp_pwm > normal_min:
+        ramp_pwm = normal_min
+
+    return int(clamp(ramp_pwm, MAINTAIN_PWM_MIN, normal_min))
 
 def calculate_extract_target_current(E_now):
     """
@@ -665,27 +730,47 @@ def calculate_extract_target_current(E_now):
 
 def enter_maintain_after_extract(va):
     """
-    Enter MAINTAIN after EXTRACT without leaving the PWM in a strong
-    discharge region.
+    Enter MAINTAIN after EXTRACT smoothly.
 
-    The old fixed 8500 PWM was too low at high Vcap. This version returns
-    to a voltage-based hold PWM, and also uses the PWM that was stable
-    before EXTRACT started if it is higher.
+    The previous version could jump from the final EXTRACT PWM around 13k
+    straight to a hold PWM around 15k. That produced a positive current
+    spike. This version only adds a small PWM step first, then lets MAINTAIN
+    ramp back up slowly.
     """
     global duty, duty_cmd, last_pwm_applied, extract_return_pwm
+    global maintain_soft_active, maintain_soft_start_pwm
+    global maintain_soft_target_pwm, maintain_soft_start_ms
 
-    target_pwm = calculate_safe_recovery_pwm(va)
+    final_extract_pwm = int(last_pwm_applied)
+    normal_min = calculate_maintain_min_pwm(va)
 
-    if extract_return_pwm > target_pwm:
-        target_pwm = extract_return_pwm
+    target_pwm = final_extract_pwm + EXTRACT_EXIT_PWM_STEP
 
-    if target_pwm < EXTRACT_EXIT_HOLD_PWM:
-        target_pwm = EXTRACT_EXIT_HOLD_PWM
+    if target_pwm > normal_min:
+        target_pwm = normal_min
+
+    if target_pwm < MIN_PWM:
+        target_pwm = MIN_PWM
 
     duty = int(clamp(target_pwm, MIN_PWM, MAX_PWM))
     duty_cmd = float(duty)
     last_pwm_applied = duty
     pwm.duty_u16(last_pwm_applied)
+
+    maintain_soft_active = True
+    maintain_soft_start_pwm = duty
+    maintain_soft_target_pwm = normal_min
+    maintain_soft_start_ms = time.ticks_ms()
+
+    print(
+        "EXTRACT handover: final_pwm={} first_hold_pwm={} "
+        "normal_min={} soft_ramp_ms={}".format(
+            final_extract_pwm,
+            duty,
+            normal_min,
+            MAINTAIN_SOFT_RAMP_MS
+        )
+    )
 
     do_maintain(va)
 
@@ -990,15 +1075,17 @@ print(
     )
 )
 print(
-    "Default STORE/EXTRACT target: {:.3f}J; software capacity: {:.3f}J "
-    "({:.3f}V max)".format(
+    "Default STORE/EXTRACT target: {:.3f}J; usable energy range: {:.3f}-{:.3f}J "
+    "({:.3f}-{:.3f}V)".format(
         E_STEP,
+        E_MIN,
         E_MAX,
+        VCAP_MIN,
         VCAP_MAX
     )
 )
 print(
-    "OPEN LIMIT TEST: STORE cold start low={} mid={} high={} using Vcap-Vbus thresholds {:.2f}V/{:.2f}V; hard_max_base={} hard_max_high={} high_from={:.2f}V; ramp_up={} count/ms; overcurrent->SAFE_HOLD; MAINTAIN base min PWM={}; stopped-current block={:.3f}A; EXTRACT floor=9.0V -> V_HOLD".format(
+    "OPEN LIMIT TEST: STORE cold start low={} mid={} high={} using Vcap-Vbus thresholds {:.2f}V/{:.2f}V; hard_max_base={} hard_max_high={} high_from={:.2f}V; ramp_up_high={} count/ms; overcurrent->SAFE_HOLD; MAINTAIN base min PWM={}; stopped-current block={:.3f}A; EXTRACT floor=9.0V -> V_HOLD".format(
         STORE_SAFE_START_PWM,
         STORE_COLD_MID_PWM,
         STORE_COLD_HIGH_PWM,
@@ -1007,7 +1094,7 @@ print(
         STORE_PWM_HARD_MAX_BASE,
         STORE_PWM_HARD_MAX_HIGH,
         STORE_HIGH_VCAP,
-        STORE_PWM_MAX_STEP_UP,
+        STORE_PWM_MAX_STEP_UP_HIGH,
         MAINTAIN_PWM_MIN,
         STOPPED_CURRENT_BLOCK_STORE
     )
@@ -1431,7 +1518,7 @@ while True:
                 pwm_step = clamp(
                     raw_step,
                     0.0,
-                    STORE_PWM_MAX_STEP_UP
+                    get_store_pwm_step_up(va)
                 )
             else:
                 pwm_step = clamp(
@@ -1480,7 +1567,7 @@ while True:
             # the safe minimum PWM must also be higher.
             duty_cmd = clamp(
                 duty_cmd + pwm_step,
-                calculate_maintain_min_pwm(va),
+                calculate_active_maintain_min_pwm(va),
                 get_store_pwm_hard_max(va)
             )
 
