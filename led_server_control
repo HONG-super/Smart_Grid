@@ -1,0 +1,76 @@
+import time
+
+import requests
+import serial
+
+
+API_URL = "https://icelec50015.azurewebsites.net"
+SERIAL_PORT = "COM3"
+BAUD_RATE = 115200
+
+SERVER_POLL_INTERVAL = 1.0
+
+
+pico = serial.Serial(
+    SERIAL_PORT,
+    BAUD_RATE,
+    timeout=0.05,
+    write_timeout=1
+)
+
+# Opening the serial port may restart the Pico
+time.sleep(3)
+
+last_tick = None
+
+try:
+    while True:
+        try:
+            response = requests.get(
+                f"{API_URL}/demand",
+                timeout=3
+            )
+
+            data = response.json()
+
+            demand = float(data["demand"])
+            tick = data["tick"]
+
+            # Send a new demand once per server tick
+            if tick != last_tick:
+                message = f"P,{demand:.3f}\n"
+
+                pico.write(message.encode("utf-8"))
+                pico.flush()
+
+                print(
+                    f"SERVER: tick={tick}, demand={demand:.3f} W"
+                )
+                print(f"SENT TO PICO: {message.strip()}")
+
+                last_tick = tick
+
+        except requests.RequestException as error:
+            print("SERVER ERROR:", error)
+
+        except (KeyError, ValueError, TypeError) as error:
+            print("INVALID SERVER DATA:", error)
+
+        # Display everything printed by Pico main.py
+        while pico.in_waiting:
+            line = pico.readline().decode(
+                "utf-8",
+                errors="ignore"
+            ).strip()
+
+            if line:
+                print("PICO:", line)
+
+        time.sleep(SERVER_POLL_INTERVAL)
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    pico.close()
+    print("Serial port closed")
