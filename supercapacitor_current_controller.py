@@ -61,7 +61,7 @@ C          = 0.5
 SHUNT_OHMS = 0.10
 dt         = 1 / 1000.0
 
-VCAP_MIN = 10.0
+VCAP_MIN = 10.5
 VCAP_MAX = 16.0
 
 # STORE is allowed slightly below the normal operating minimum during testing,
@@ -104,8 +104,8 @@ CSV_LOG_INTERVAL_MS = 50     # one row every 50 ms = about 800 rows
 # and control delay mean we use a higher current target. Watch board temperature.
 I_STORE    =  0.70          # Faster but safer store current target, A
 I_EXTRACT  = -0.70          # Safer extract current target, A
-I_MAINTAIN =  0.02           # Maintain current target, A
-I_LIMIT    =  1.0          # Hard overcurrent trip limit, A
+I_MAINTAIN =  0.03           # Maintain current target, A
+I_LIMIT    =  1.20          # Hard overcurrent trip limit, A
 
 
 # ============================================================
@@ -1025,8 +1025,12 @@ def print_status():
     else:
         elapsed_s = 0.0
 
+    energy_space = clamp(E_MAX - last_E, 0.0, E_MAX - E_MIN)
+    energy_available = clamp(last_E - E_MIN, 0.0, E_MAX - E_MIN)
+
     print(
-        "mode={} trip={} Vcap={:.3f}V IL={:.3f}A E={:.3f}J "
+        "mode={} trip={} Vcap={:.3f}V IL={:.3f}A "
+        "E={:.3f}J Espace={:.3f}J Eout={:.3f}J "
         "dE={:.3f}J SoC={:.1f}% target={:.3f}A "
         "duty={} pwm_applied={} t={:.3f}s".format(
             mode,
@@ -1034,6 +1038,8 @@ def print_status():
             last_va,
             last_IL,
             last_E,
+            energy_space,
+            energy_available,
             E_delta,
             last_SoC,
             I_target,
