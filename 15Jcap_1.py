@@ -2,7 +2,7 @@
 # Hardware: 0.5 F cap, Vbus = 10.0 V
 # WARNING: this is a test version with opened STORE PWM ceiling. Use PSU current limit.
 # Commands: S=store  E=extract  U=maintain  H=stop  P=print  C=40s CSV log
-# Version: v20 15J STORE/EXTRACT + earlier EXTRACT brake
+# Version: v21 15J STORE/EXTRACT + smooth MAINTAIN handover
 # Main changes:
 # 1) Raise high-voltage STORE ceiling to 15000 because 14000 still limited current near 12 V.
 # 2) Use voltage-based SAFE_HOLD / recovery so EXTRACT handover does not keep discharging.
@@ -10,6 +10,7 @@
 # 4) Allow direct S start from STOPPED/TRIPPED when current is already safe.
 # 5) Reduce EXTRACT end overcurrent by braking earlier and switching back more smoothly.
 # 6) v20: stronger final EXTRACT braking after the 1.207 A end spike test.
+# 7) v21: EXTRACT -> MAINTAIN no longer jumps straight to high hold PWM.
 
 from machine import Pin, I2C, ADC, PWM, Timer
 import time
@@ -165,7 +166,9 @@ I_SAFE_HOLD = 0.04
 # a PWM could keep a large negative current flowing and over-discharge the cap.
 # Therefore EXTRACT slows down near the energy target and jumps to a safer
 # hold PWM before entering MAINTAIN.
-EXTRACT_EXIT_HOLD_PWM = 14500
+EXTRACT_EXIT_HOLD_PWM = 14500       # Upper target only; do not jump to it directly after EXTRACT
+EXTRACT_EXIT_PWM_STEP = 300         # First handover step from final EXTRACT PWM
+MAINTAIN_SOFT_RAMP_MS = 1400        # Time to ramp MAINTAIN minimum upward after EXTRACT
 EXTRACT_BRAKE_1_J = 1.30
 EXTRACT_BRAKE_2_J = 0.65
 EXTRACT_BRAKE_3_J = 0.25
@@ -233,6 +236,10 @@ action_in_progress = False
 action_start_ms = 0
 store_deadline_reported = False
 extract_return_pwm = 0
+maintain_soft_active = False
+maintain_soft_start_pwm = 0
+maintain_soft_target_pwm = 0
+maintain_soft_start_ms = 0
 
 mode = "STOPPED"
 command = ""
@@ -627,11 +634,45 @@ def calculate_safe_recovery_pwm(va):
 
 def calculate_maintain_min_pwm(va):
     """
-    Keep MAINTAIN away from the low-duty reverse-current region.
+    Keep normal MAINTAIN away from the low-duty reverse-current region.
     The minimum is raised when Vcap is high.
     """
     safe_pwm = calculate_safe_recovery_pwm(va) - 2500
     return int(clamp(safe_pwm, MAINTAIN_PWM_MIN, 23000))
+
+
+def calculate_active_maintain_min_pwm(va):
+    """
+    Normal MAINTAIN needs a high minimum PWM at high Vcap, but jumping
+    directly to that minimum right after EXTRACT caused a positive current
+    spike. During the short handover period, ramp the minimum upward instead.
+    """
+    global maintain_soft_active
+
+    normal_min = calculate_maintain_min_pwm(va)
+
+    if not maintain_soft_active:
+        return normal_min
+
+    elapsed_ms = time.ticks_diff(time.ticks_ms(), maintain_soft_start_ms)
+
+    if elapsed_ms >= MAINTAIN_SOFT_RAMP_MS:
+        maintain_soft_active = False
+        return normal_min
+
+    if maintain_soft_target_pwm <= maintain_soft_start_pwm:
+        return normal_min
+
+    ramp_pwm = maintain_soft_start_pwm + (
+        (maintain_soft_target_pwm - maintain_soft_start_pwm)
+        * elapsed_ms
+        / MAINTAIN_SOFT_RAMP_MS
+    )
+
+    if ramp_pwm > normal_min:
+        ramp_pwm = normal_min
+
+    return int(clamp(ramp_pwm, MAINTAIN_PWM_MIN, normal_min))
 
 def calculate_extract_target_current(E_now):
     """
@@ -662,27 +703,47 @@ def calculate_extract_target_current(E_now):
 
 def enter_maintain_after_extract(va):
     """
-    Enter MAINTAIN after EXTRACT without leaving the PWM in a strong
-    discharge region.
+    Enter MAINTAIN after EXTRACT smoothly.
 
-    The old fixed 8500 PWM was too low at high Vcap. This version returns
-    to a voltage-based hold PWM, and also uses the PWM that was stable
-    before EXTRACT started if it is higher.
+    The previous version could jump from the final EXTRACT PWM around 13k
+    straight to a hold PWM around 15k. That produced a positive current
+    spike. This version only adds a small PWM step first, then lets MAINTAIN
+    ramp back up slowly.
     """
     global duty, duty_cmd, last_pwm_applied, extract_return_pwm
+    global maintain_soft_active, maintain_soft_start_pwm
+    global maintain_soft_target_pwm, maintain_soft_start_ms
 
-    target_pwm = calculate_safe_recovery_pwm(va)
+    final_extract_pwm = int(last_pwm_applied)
+    normal_min = calculate_maintain_min_pwm(va)
 
-    if extract_return_pwm > target_pwm:
-        target_pwm = extract_return_pwm
+    target_pwm = final_extract_pwm + EXTRACT_EXIT_PWM_STEP
 
-    if target_pwm < EXTRACT_EXIT_HOLD_PWM:
-        target_pwm = EXTRACT_EXIT_HOLD_PWM
+    if target_pwm > normal_min:
+        target_pwm = normal_min
+
+    if target_pwm < MIN_PWM:
+        target_pwm = MIN_PWM
 
     duty = int(clamp(target_pwm, MIN_PWM, MAX_PWM))
     duty_cmd = float(duty)
     last_pwm_applied = duty
     pwm.duty_u16(last_pwm_applied)
+
+    maintain_soft_active = True
+    maintain_soft_start_pwm = duty
+    maintain_soft_target_pwm = normal_min
+    maintain_soft_start_ms = time.ticks_ms()
+
+    print(
+        "EXTRACT handover: final_pwm={} first_hold_pwm={} "
+        "normal_min={} soft_ramp_ms={}".format(
+            final_extract_pwm,
+            duty,
+            normal_min,
+            MAINTAIN_SOFT_RAMP_MS
+        )
+    )
 
     do_maintain(va)
 
@@ -1434,7 +1495,7 @@ while True:
             # the safe minimum PWM must also be higher.
             duty_cmd = clamp(
                 duty_cmd + pwm_step,
-                calculate_maintain_min_pwm(va),
+                calculate_active_maintain_min_pwm(va),
                 get_store_pwm_hard_max(va)
             )
 
