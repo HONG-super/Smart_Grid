@@ -2,7 +2,7 @@
 # Hardware: 0.5 F cap, Vbus = 10.0 V
 # WARNING: this is a test version with opened STORE PWM ceiling. Use PSU current limit.
 # Commands: S[J]=store  E[J]=extract  U=maintain  H=stop  P=print  C=40s CSV log
-# Version: v23 selectable STORE/EXTRACT energy + slower status output
+# Version: v24 ESR-corrected capacitor voltage
 # Main changes:
 # 1) Raise high-voltage STORE ceiling to 15000 because 14000 still limited current near 12 V.
 # 2) Use voltage-based SAFE_HOLD / recovery so EXTRACT handover does not keep discharging.
@@ -13,6 +13,7 @@
 # 7) v21: EXTRACT -> MAINTAIN no longer jumps straight to high hold PWM.
 # 8) v22: faster STORE PWM ramp above 12.5 V / 13.8 V to improve high-voltage charging speed.
 # 9) v23: status auto-print reduced to 1 Hz to reduce serial load.
+# 10) v24: correct measured terminal voltage for 2 ohm effective capacitor ESR.
 
 from machine import Pin, I2C, ADC, PWM, Timer
 import time
@@ -59,6 +60,7 @@ led.on()
 V_BUS      = 10
 C          = 0.5
 SHUNT_OHMS = 0.10
+CAP_ESR_OHMS = 2.0           # Two 4 ohm capacitors in parallel -> 2 ohm total ESR
 dt         = 1 / 1000.0
 
 VCAP_MIN = 10.5
@@ -185,9 +187,9 @@ I_EXTRACT_BRAKE_3 = -0.06
 EXTRACT_DONE_TOL_J = 0.25
 
 # EXTRACT voltage floor hold.
-# When EXTRACT reaches 9.0 V, this is no longer treated as a fault.
+# When EXTRACT reaches VCAP_MIN, this is no longer treated as a fault.
 # The controller enters V_HOLD mode and tries to keep the capacitor around
-# 9.0 V instead of tripping.
+# VCAP_MIN instead of tripping.
 V_HOLD_REF = VCAP_MIN
 V_HOLD_BAND = 0.04
 I_VHOLD_CHARGE = 0.08
@@ -268,6 +270,7 @@ last_status_print_ms = 0
 # ============================================================
 
 last_va = 0.0
+last_va_terminal = 0.0
 last_IL = 0.0
 last_E = 0.0
 last_SoC = 0.0
@@ -333,6 +336,11 @@ def clamp(value, lower, upper):
 
 def read_vcap():
     return 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
+
+
+def correct_vcap_for_esr(v_terminal, cap_current):
+    # IL is positive while charging and negative while extracting.
+    return v_terminal - cap_current * CAP_ESR_OHMS
 
 
 def reset_pid():
@@ -618,10 +626,10 @@ def do_maintain(va):
 
 
 def calculate_vhold_current(va):
-    # Simple voltage-floor hold around 9.0 V.
-    # Below 9.0 V: gently charge.
-    # Around 9.0 V: small positive float current.
-    # Above 9.0 V: allow a very small discharge command, but the
+    # Simple voltage-floor hold around VCAP_MIN.
+    # Below VCAP_MIN: gently charge.
+    # Around VCAP_MIN: small positive float current.
+    # Above VCAP_MIN: allow a very small discharge command, but the
     # MAINTAIN_PWM_MIN protection prevents falling into the dangerous
     # low-duty reverse-current region.
     if va < V_HOLD_REF - V_HOLD_BAND:
@@ -873,7 +881,7 @@ def start_csv_log():
 
         csv_file.write(
             "time_ms,elapsed_ms,mode,trip,hard_stopped,"
-            "action_in_progress,Vcap,IL,IL_filtered,E,E_delta,"
+            "action_in_progress,Vterm,Vcap,IL,IL_filtered,E,E_delta,"
             "SoC,I_target,duty,pwm_applied\n"
         )
         csv_file.flush()
@@ -917,7 +925,7 @@ def stop_csv_log():
     )
 
 
-def update_csv_log(now_ms, va, IL, E, SoC):
+def update_csv_log(now_ms, va_terminal, va, IL, E, SoC):
     global csv_last_ms, csv_rows
 
     if not csv_logging:
@@ -936,7 +944,7 @@ def update_csv_log(now_ms, va, IL, E, SoC):
 
     try:
         csv_file.write(
-            "{},{},{},{},{},{},{:.4f},{:.4f},{:.4f},"
+            "{},{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
             "{:.4f},{:.4f},{:.2f},{:.4f},{},{}\n".format(
                 now_ms,
                 elapsed_ms,
@@ -944,6 +952,7 @@ def update_csv_log(now_ms, va, IL, E, SoC):
                 int(trip),
                 int(hard_stopped),
                 int(action_in_progress),
+                va_terminal,
                 va,
                 IL,
                 IL_filtered,
@@ -1029,12 +1038,13 @@ def print_status():
     energy_available = clamp(last_E - E_MIN, 0.0, E_MAX - E_MIN)
 
     print(
-        "mode={} trip={} Vcap={:.3f}V IL={:.3f}A "
+        "mode={} trip={} Vterm={:.3f}V Vcap={:.3f}V IL={:.3f}A "
         "E={:.3f}J Espace={:.3f}J Eout={:.3f}J "
         "dE={:.3f}J SoC={:.1f}% target={:.3f}A "
         "duty={} pwm_applied={} t={:.3f}s".format(
             mode,
             trip,
+            last_va_terminal,
             last_va,
             last_IL,
             last_E,
@@ -1071,6 +1081,7 @@ loop_r = Timer(
 print("Ready. Commands: S[J] E[J] U H P C")
 print("Examples: S8 charges 8J, E3.5 extracts 3.5J. S/E alone use default.")
 print("PWM initially OFF.")
+print("ESR correction enabled: Vcap = Vterm - IL * {:.3f} ohm".format(CAP_ESR_OHMS))
 print(
     "I_STORE={:.3f}A I_EXTRACT={:.3f}A "
     "I_MAINTAIN={:.3f}A I_LIMIT={:.3f}A".format(
@@ -1091,7 +1102,7 @@ print(
     )
 )
 print(
-    "OPEN LIMIT TEST: STORE cold start low={} mid={} high={} using Vcap-Vbus thresholds {:.2f}V/{:.2f}V; hard_max_base={} hard_max_high={} high_from={:.2f}V; ramp_up_high={} count/ms; overcurrent->SAFE_HOLD; MAINTAIN base min PWM={}; stopped-current block={:.3f}A; EXTRACT floor=9.0V -> V_HOLD".format(
+    "OPEN LIMIT TEST: STORE cold start low={} mid={} high={} using Vcap-Vbus thresholds {:.2f}V/{:.2f}V; hard_max_base={} hard_max_high={} high_from={:.2f}V; ramp_up_high={} count/ms; overcurrent->SAFE_HOLD; MAINTAIN base min PWM={}; stopped-current block={:.3f}A; EXTRACT floor={:.2f}V -> V_HOLD".format(
         STORE_SAFE_START_PWM,
         STORE_COLD_MID_PWM,
         STORE_COLD_HIGH_PWM,
@@ -1102,7 +1113,8 @@ print(
         STORE_HIGH_VCAP,
         STORE_PWM_MAX_STEP_UP_HIGH,
         MAINTAIN_PWM_MIN,
-        STOPPED_CURRENT_BLOCK_STORE
+        STOPPED_CURRENT_BLOCK_STORE,
+        VCAP_MIN
     )
 )
 
@@ -1124,8 +1136,9 @@ while True:
     # --------------------------------------------------------
 
     try:
-        va = read_vcap()
+        va_terminal = read_vcap()
         IL = -ina.vshunt() / SHUNT_OHMS
+        va = correct_vcap_for_esr(va_terminal, IL)
 
     except Exception as e:
         do_trip("sensor error: " + str(e))
@@ -1136,12 +1149,13 @@ while True:
     SoC = clamp(E / E_MAX * 100.0, 0.0, 100.0)
 
     last_va = va
+    last_va_terminal = va_terminal
     last_IL = IL
     last_E = E
     last_SoC = SoC
 
     now_ms = time.ticks_ms()
-    update_csv_log(now_ms, va, IL, E, SoC)
+    update_csv_log(now_ms, va_terminal, va, IL, E, SoC)
 
     # If current is flowing while PWM is already OFF, the converter is
     # not the thing controlling current. Warn, but do not call pwm_off()
@@ -1183,8 +1197,8 @@ while True:
         continue
 
     if not trip and mode == "EXTRACT" and va <= VCAP_MIN:
-        # 9.0 V is the normal lower operating floor for EXTRACT,
-        # not a fault. Stop extracting and hold around 9.0 V.
+        # VCAP_MIN is the normal lower operating floor for EXTRACT,
+        # not a fault. Stop extracting and hold around VCAP_MIN.
         if action_in_progress:
             E_delta = E - E_initial
             elapsed_s = time.ticks_diff(
@@ -1193,8 +1207,9 @@ while True:
             ) / 1000.0
 
             print(
-                "EXTRACT reached 9.0V floor. deltaE={:.3f}J "
+                "EXTRACT reached {:.2f}V floor. deltaE={:.3f}J "
                 "time={:.3f}s E={:.3f}J Vcap={:.3f}V -> V_HOLD".format(
+                    VCAP_MIN,
                     E_delta,
                     elapsed_s,
                     E,
@@ -1364,8 +1379,8 @@ while True:
 
         elif E <= E_MIN + 0.05:
             print(
-                "Already at 9.0V lower floor ({:.3f}J). "
-                "Entering V_HOLD instead of EXTRACT.".format(E)
+                "Already at {:.2f}V lower floor ({:.3f}J). "
+                "Entering V_HOLD instead of EXTRACT.".format(VCAP_MIN, E)
             )
             if not hard_stopped:
                 do_voltage_hold_floor(va)
