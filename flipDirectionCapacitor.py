@@ -5,6 +5,8 @@
 # Commands:
 #   S        precharge to PRECHARGE_TARGET_V
 #   S10      precharge, then keep passive charging until +10 J if possible
+#   E        discharge DEFAULT_DISCHARGE_J
+#   E5       discharge 5 J
 #   H        stop, PWM off
 #   P        print one status line
 #
@@ -55,6 +57,7 @@ led.on()
 V_BUS_MIN = 8.0
 V_CAP_ABSOLUTE_MIN = 0.8
 PRECHARGE_TARGET_V = 8.0
+DISCHARGE_STOP_V = 8.0
 PASSIVE_STOP_MARGIN_V = 0.25
 
 C_FARADS = 1.5
@@ -66,10 +69,18 @@ MAX_PWM_OUT = 64536
 
 I_PRECHARGE_LIMIT = 0.45
 I_REVERSE_LIMIT = -0.08
+I_DISCHARGE_TARGET = -0.10
+I_DISCHARGE_LIMIT = -0.45
 I_HARD_LIMIT = 1.20
 
 DEFAULT_CHARGE_J = 0.0
+DEFAULT_DISCHARGE_J = 5.0
 STATUS_INTERVAL_MS = 1000
+
+DISCHARGE_START_PWM_OUT = MAX_PWM_OUT
+DISCHARGE_MIN_PWM_OUT = 30000
+DISCHARGE_STEP_DOWN = 4
+DISCHARGE_STEP_UP = 200
 
 
 # ============================================================
@@ -142,11 +153,11 @@ def write_pwm_out(pwm_out):
     pwm.duty_u16(duty_actual)
 
 
-def parse_energy_amount(text):
+def parse_energy_amount(text, default_value):
     text = text.strip().upper()
 
     if not text:
-        return DEFAULT_CHARGE_J
+        return default_value
 
     if text[0] in "=:":
         text = text[1:].strip()
@@ -257,6 +268,50 @@ def start_precharge(request_j):
     )
 
 
+def start_discharge(request_j):
+    global mode, target_energy_j, start_energy_j
+
+    if trip:
+        print("Trip active. Send H first.")
+        return
+
+    if request_j <= 0.0:
+        print("Invalid discharge amount. Use E or E5.")
+        return
+
+    if last_vcap <= DISCHARGE_STOP_V:
+        print(
+            "Discharge blocked: Vcap={:.3f}V is already at/below {:.3f}V.".format(
+                last_vcap,
+                DISCHARGE_STOP_V
+            )
+        )
+        return
+
+    if last_vbus < V_BUS_MIN:
+        print(
+            "Discharge blocked: Vbus={:.3f}V below {:.3f}V.".format(
+                last_vbus,
+                V_BUS_MIN
+            )
+        )
+        return
+
+    start_energy_j = last_energy
+    target_energy_j = request_j
+    mode = "DISCHARGE"
+    write_pwm_out(DISCHARGE_START_PWM_OUT)
+
+    print(
+        "DISCHARGE started: target -{:.3f}J, stop at Vcap <= {:.3f}V, "
+        "current target {:.3f}A.".format(
+            target_energy_j,
+            DISCHARGE_STOP_V,
+            I_DISCHARGE_TARGET
+        )
+    )
+
+
 def read_cmd():
     global command, command_energy_j
 
@@ -270,7 +325,7 @@ def read_cmd():
             cmd = line[0]
 
             if cmd == "S":
-                amount = parse_energy_amount(line[1:])
+                amount = parse_energy_amount(line[1:], DEFAULT_CHARGE_J)
 
                 if amount is None:
                     print("Invalid command. Use S, S10, or S10J.")
@@ -279,11 +334,21 @@ def read_cmd():
                 command_energy_j = amount
                 command = "S"
 
+            elif cmd == "E":
+                amount = parse_energy_amount(line[1:], DEFAULT_DISCHARGE_J)
+
+                if amount is None:
+                    print("Invalid command. Use E, E5, or E5J.")
+                    return
+
+                command_energy_j = amount
+                command = "E"
+
             elif cmd in "HP":
                 command = cmd
 
             else:
-                print("Unknown command. Use S, H, or P.")
+                print("Unknown command. Use S, E, H, or P.")
 
     except:
         pass
@@ -332,12 +397,19 @@ loop_timer = Timer(
 
 print("Simple capacitor controller ready.")
 print("A port = DC bus, B port = capacitor.")
-print("Commands: S, S10, H, P")
+print("Commands: S, S10, E, E5, H, P")
 print("PWM convention: duty_actual = 65536 - pwm_out, but PRECHARGE uses PWM off.")
 print(
     "PRECHARGE: PWM off until Vcap >= {:.3f}V; current limit {:.3f}A.".format(
         PRECHARGE_TARGET_V,
         I_PRECHARGE_LIMIT
+    )
+)
+print(
+    "DISCHARGE: E or E5, target {:.3f}A, stop at {:.3f}V, current limit {:.3f}A.".format(
+        I_DISCHARGE_TARGET,
+        DISCHARGE_STOP_V,
+        I_DISCHARGE_LIMIT
     )
 )
 
@@ -384,6 +456,10 @@ while True:
     elif command == "S":
         command = ""
         start_precharge(command_energy_j)
+
+    elif command == "E":
+        command = ""
+        start_discharge(command_energy_j)
 
     if not trip and mode == "PRECHARGE":
 
@@ -436,6 +512,58 @@ while True:
                 )
                 mode = "STOPPED"
                 pwm_off()
+
+    if not trip and mode == "DISCHARGE":
+
+        if abs(il) >= I_HARD_LIMIT:
+            do_trip("hard overcurrent during discharge {:.3f}A".format(il))
+            continue
+
+        discharged_j = start_energy_j - energy
+
+        if discharged_j >= target_energy_j:
+            print(
+                "DISCHARGE done: dE=-{:.3f}J Vcap={:.3f}V. PWM off.".format(
+                    discharged_j,
+                    vcap
+                )
+            )
+            mode = "STOPPED"
+            pwm_off()
+            continue
+
+        if vcap <= DISCHARGE_STOP_V:
+            print(
+                "DISCHARGE stopped: Vcap={:.3f}V reached limit {:.3f}V. "
+                "dE=-{:.3f}J target=-{:.3f}J. PWM off.".format(
+                    vcap,
+                    DISCHARGE_STOP_V,
+                    discharged_j,
+                    target_energy_j
+                )
+            )
+            mode = "STOPPED"
+            pwm_off()
+            continue
+
+        if il <= I_DISCHARGE_LIMIT:
+            next_pwm = last_pwm_out + DISCHARGE_STEP_UP
+            write_pwm_out(next_pwm)
+            print(
+                "Discharge current too high: IL={:.3f}A, backing off pwm_out={}.".format(
+                    il,
+                    last_pwm_out
+                )
+            )
+            continue
+
+        if il > I_DISCHARGE_TARGET:
+            next_pwm = last_pwm_out - DISCHARGE_STEP_DOWN
+            write_pwm_out(max(next_pwm, DISCHARGE_MIN_PWM_OUT))
+
+        else:
+            next_pwm = last_pwm_out + DISCHARGE_STEP_UP
+            write_pwm_out(min(next_pwm, DISCHARGE_START_PWM_OUT))
 
     now_ms = time.ticks_ms()
     if time.ticks_diff(now_ms, last_status_ms) >= STATUS_INTERVAL_MS:
