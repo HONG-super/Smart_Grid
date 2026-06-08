@@ -109,8 +109,14 @@ CSV_LOG_INTERVAL_MS = 50     # one row every 50 ms = about 800 rows
 # and control delay mean we use a higher current target. Watch board temperature.
 I_STORE    =  0.70          # Faster but safer store current target, A
 I_EXTRACT  = -0.70          # Safer extract current target, A
+I_PRECHARGE = 0.08          # Low-current start when capacitor is below VCAP_STORE_MIN, A
 I_MAINTAIN =  0.03           # Maintain current target, A
 I_LIMIT    =  1.20          # Hard overcurrent trip limit, A
+
+V_BUS_PRECHARGE_MIN = 8.0
+VCAP_PRECHARGE_MIN = 0.8
+PRECHARGE_TARGET_V = VCAP_MIN
+PRECHARGE_PWM_HARD_MAX = 12520
 
 
 # ============================================================
@@ -248,6 +254,7 @@ action_in_progress = False
 action_start_ms = 0
 store_deadline_reported = False
 extract_return_pwm = 0
+precharge_followup_energy_j = 0.0
 maintain_soft_active = False
 maintain_soft_start_pwm = 0
 maintain_soft_target_pwm = 0
@@ -274,6 +281,7 @@ last_status_print_ms = 0
 
 last_va = 0.0
 last_va_terminal = 0.0
+last_vbus = 0.0
 last_IL = 0.0
 last_E = 0.0
 last_SoC = 0.0
@@ -597,6 +605,7 @@ def do_stop():
     global action_in_progress, mode, I_target
     global E_delta, E_target_action
     global store_deadline_reported
+    global precharge_followup_energy_j
 
     trip = False
     trip_reason = ""
@@ -610,6 +619,7 @@ def do_stop():
     E_delta = 0.0
     E_target_action = 0.0
     store_deadline_reported = False
+    precharge_followup_energy_j = 0.0
 
     reset_pid()
 
@@ -899,7 +909,7 @@ def start_csv_log():
 
         csv_file.write(
             "time_ms,elapsed_ms,mode,trip,hard_stopped,"
-            "action_in_progress,Vterm,Vcap,IL,IL_filtered,E,E_delta,"
+            "action_in_progress,Vbus,Vterm,Vcap,IL,IL_filtered,E,E_delta,"
             "SoC,I_target,duty,pwm_command,pwm_actual\n"
         )
         csv_file.flush()
@@ -943,7 +953,7 @@ def stop_csv_log():
     )
 
 
-def update_csv_log(now_ms, va_terminal, va, IL, E, SoC):
+def update_csv_log(now_ms, vbus, va_terminal, va, IL, E, SoC):
     global csv_last_ms, csv_rows
 
     if not csv_logging:
@@ -962,7 +972,7 @@ def update_csv_log(now_ms, va_terminal, va, IL, E, SoC):
 
     try:
         csv_file.write(
-            "{},{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
+            "{},{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},"
             "{:.4f},{:.4f},{:.2f},{:.4f},{},{},{}\n".format(
                 now_ms,
                 elapsed_ms,
@@ -970,6 +980,7 @@ def update_csv_log(now_ms, va_terminal, va, IL, E, SoC):
                 int(trip),
                 int(hard_stopped),
                 int(action_in_progress),
+                vbus,
                 va_terminal,
                 va,
                 IL,
@@ -1057,12 +1068,13 @@ def print_status():
     energy_available = clamp(last_E - E_MIN, 0.0, E_MAX - E_MIN)
 
     print(
-        "mode={} trip={} Vterm={:.3f}V Vcap={:.3f}V IL={:.3f}A "
+        "mode={} trip={} Vbus={:.3f}V Vterm={:.3f}V Vcap={:.3f}V IL={:.3f}A "
         "E={:.3f}J Espace={:.3f}J Eout={:.3f}J "
         "dE={:.3f}J SoC={:.1f}% target={:.3f}A "
         "duty={} pwm_cmd={} pwm_actual={} t={:.3f}s".format(
             mode,
             trip,
+            last_vbus,
             last_va_terminal,
             last_va,
             last_IL,
@@ -1104,6 +1116,15 @@ print("PWM initially OFF.")
 print("Port wiring: A port = DC bus, B port = capacitor.")
 print("Active PWM is inverted: pwm_actual = 65536 - pwm_cmd.")
 print("ESR correction enabled: Vcap = Vterm - IL * {:.3f} ohm".format(CAP_ESR_OHMS))
+print(
+    "PRECHARGE enabled: S below {:.3f}V charges at {:.3f}A until {:.3f}V; "
+    "requires Vbus >= {:.3f}V.".format(
+        VCAP_STORE_MIN,
+        I_PRECHARGE,
+        PRECHARGE_TARGET_V,
+        V_BUS_PRECHARGE_MIN
+    )
+)
 print(
     "I_STORE={:.3f}A I_EXTRACT={:.3f}A "
     "I_MAINTAIN={:.3f}A I_LIMIT={:.3f}A".format(
@@ -1158,6 +1179,7 @@ while True:
     # --------------------------------------------------------
 
     try:
+        vbus = read_vbus()
         va_terminal = read_vcap()
         IL = ina.vshunt() / SHUNT_OHMS
         va = correct_vcap_for_esr(va_terminal, IL)
@@ -1172,12 +1194,13 @@ while True:
 
     last_va = va
     last_va_terminal = va_terminal
+    last_vbus = vbus
     last_IL = IL
     last_E = E
     last_SoC = SoC
 
     now_ms = time.ticks_ms()
-    update_csv_log(now_ms, va_terminal, va, IL, E, SoC)
+    update_csv_log(now_ms, vbus, va_terminal, va, IL, E, SoC)
 
     # If current is flowing while PWM is already OFF, the converter is
     # not the thing controlling current. Warn, but do not call pwm_off()
@@ -1192,10 +1215,10 @@ while True:
     if (
         not trip
         and not hard_stopped
-        and mode == "STORE"
+        and (mode == "STORE" or mode == "PRECHARGE")
         and IL <= STORE_REVERSE_CURRENT_LIMIT
     ):
-        do_trip("store reverse current {:.3f}A".format(IL), reverse_hold=True)
+        do_trip("{} reverse current {:.3f}A".format(mode.lower(), IL), reverse_hold=True)
         continue
 
     if (
@@ -1316,12 +1339,21 @@ while True:
         elif action_in_progress:
             print("Action in progress.")
 
-        elif va < VCAP_STORE_MIN:
+        elif va < VCAP_PRECHARGE_MIN:
             print(
-                "STORE blocked: Vcap={:.3f}V below {:.3f}V. "
-                "Check capacitor voltage, ADC divider, and wiring.".format(
+                "PRECHARGE blocked: Vcap={:.3f}V below {:.3f}V. "
+                "Check capacitor voltage, ADC divider, and wiring before starting.".format(
                     va,
-                    VCAP_STORE_MIN
+                    VCAP_PRECHARGE_MIN
+                )
+            )
+
+        elif va < VCAP_STORE_MIN and vbus < V_BUS_PRECHARGE_MIN:
+            print(
+                "PRECHARGE blocked: Vbus={:.3f}V below {:.3f}V. "
+                "Check A port DC bus supply.".format(
+                    vbus,
+                    V_BUS_PRECHARGE_MIN
                 )
             )
 
@@ -1338,6 +1370,53 @@ while True:
 
         elif E >= E_MAX - 0.05:
             print("Already at max energy ({:.3f}J).".format(E))
+
+        elif va < VCAP_STORE_MIN:
+            start_pwm = calculate_store_warm_start_pwm(va)
+
+            if hard_stopped:
+                pwm_start(start_pwm)
+                store_start_type = "cold"
+            else:
+                duty = int(clamp(start_pwm, MIN_PWM, PRECHARGE_PWM_HARD_MAX))
+                duty_cmd = float(duty)
+                last_pwm_applied = duty
+                write_active_pwm(last_pwm_applied)
+                hard_stopped = False
+                reset_pid()
+                store_start_type = "warm"
+
+            E_initial = E
+            E_delta = 0.0
+            E_target_action = 0.5 * C * PRECHARGE_TARGET_V ** 2 - E
+
+            if E_target_action < 0.0:
+                E_target_action = 0.0
+
+            precharge_followup_energy_j = command_energy_j
+            I_target = I_PRECHARGE
+            action_in_progress = True
+            mode = "PRECHARGE"
+
+            action_start_ms = time.ticks_ms()
+            store_deadline_reported = True
+
+            IL_filtered = IL
+            reset_pid()
+
+            print(
+                "PRECHARGE: Vcap={:.3f}V -> {:.3f}V, target +{:.3f}J, "
+                "then STORE +{:.3f}J. I_target={:.3f}A start_pwm={} type={} Vbus={:.3f}V".format(
+                    va,
+                    PRECHARGE_TARGET_V,
+                    E_target_action,
+                    precharge_followup_energy_j,
+                    I_target,
+                    start_pwm,
+                    store_start_type,
+                    vbus
+                )
+            )
 
         else:
             start_pwm = calculate_store_warm_start_pwm(va)
@@ -1455,7 +1534,44 @@ while True:
 
         E_delta = E - E_initial
 
-        if mode == "STORE" and E_delta >= E_target_action:
+        if mode == "PRECHARGE" and va >= PRECHARGE_TARGET_V:
+
+            elapsed_s = time.ticks_diff(
+                time.ticks_ms(),
+                action_start_ms
+            ) / 1000.0
+
+            print(
+                "PRECHARGE done. Vcap={:.3f}V E={:.3f}J "
+                "time={:.3f}s -> STORE +{:.3f}J".format(
+                    va,
+                    E,
+                    elapsed_s,
+                    precharge_followup_energy_j
+                )
+            )
+
+            E_initial = E
+            E_delta = 0.0
+            E_target_action = min(precharge_followup_energy_j, E_MAX - E)
+
+            I_target = I_STORE
+            mode = "STORE"
+            action_start_ms = time.ticks_ms()
+            store_deadline_reported = False
+            IL_filtered = IL
+            reset_pid()
+
+            print(
+                "STORE: target +{:.3f}J after precharge from {:.3f}J. "
+                "I_target={:.3f}A".format(
+                    E_target_action,
+                    E,
+                    I_target
+                )
+            )
+
+        elif mode == "STORE" and E_delta >= E_target_action:
 
             elapsed_s = time.ticks_diff(
                 time.ticks_ms(),
@@ -1537,7 +1653,7 @@ while True:
 
     if control_allowed:
 
-        if mode == "STORE":
+        if mode == "STORE" or mode == "PRECHARGE":
 
             # ------------------------------------------------
             # SAFE STORE controller
@@ -1570,10 +1686,15 @@ while True:
                     0.0
                 )
 
+            if mode == "PRECHARGE":
+                store_pwm_max = PRECHARGE_PWM_HARD_MAX
+            else:
+                store_pwm_max = get_store_pwm_hard_max(va)
+
             duty_cmd = clamp(
                 duty_cmd + pwm_step,
                 MIN_PWM,
-                get_store_pwm_hard_max(va)
+                store_pwm_max
             )
 
             duty = int(duty_cmd)
