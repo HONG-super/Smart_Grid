@@ -49,7 +49,7 @@ pwm.duty_u16(0)
 led = Pin("LED", Pin.OUT)
 led.on()
 
-CODE_VERSION = "cap_4V_16V_ESR_2ohm_2026_06_08"
+CODE_VERSION = "cap_4V_16V_ESR_2ohm_charge_no_reverse_2026_06_08"
 
 
 # ============================================================
@@ -67,11 +67,11 @@ SHUNT_OHMS = 0.10
 CAP_ESR_OHMS = 2.00
 
 MIN_PWM_OUT = 0
-MAX_PWM_OUT = 64536
+MAX_PWM_OUT = 65535
 
 I_PRECHARGE_LIMIT = 0.45
 I_CHARGE_TARGET = 0.10
-I_REVERSE_LIMIT = -0.45
+I_CHARGE_REVERSE_STOP = -0.02
 I_DISCHARGE_TARGET = -0.10
 I_DISCHARGE_LIMIT = -0.45
 I_HARD_LIMIT = 1.20
@@ -81,11 +81,11 @@ DEFAULT_DISCHARGE_J = 5.0
 STATUS_INTERVAL_MS = 1000
 
 CHARGE_START_PWM_OUT = MAX_PWM_OUT
-CHARGE_MIN_PWM_OUT = 45000
-CHARGE_STEP_DOWN = 4
+CHARGE_MIN_PWM_OUT = 64536
+CHARGE_STEP_DOWN = 1
 CHARGE_STEP_UP = 200
 
-DISCHARGE_START_PWM_OUT = MAX_PWM_OUT
+DISCHARGE_START_PWM_OUT = 64536
 DISCHARGE_MIN_PWM_OUT = 30000
 DISCHARGE_STEP_DOWN = 4
 DISCHARGE_STEP_UP = 200
@@ -452,6 +452,11 @@ print(
     )
 )
 print(
+    "CHARGE protection: stop and PWM off if IL <= {:.3f}A.".format(
+        I_CHARGE_REVERSE_STOP
+    )
+)
+print(
     "DISCHARGE: E or E5, target {:.3f}A, stop at {:.3f}V, current limit {:.3f}A.".format(
         I_DISCHARGE_TARGET,
         V_CAP_MIN,
@@ -564,13 +569,13 @@ while True:
             )
             continue
 
-        if il <= I_REVERSE_LIMIT:
-            next_pwm = last_pwm_out + CHARGE_STEP_UP
-            write_pwm_out(next_pwm)
+        if il <= I_CHARGE_REVERSE_STOP:
+            mode = "STOPPED"
+            pwm_off()
             print(
-                "Charge reverse current: IL={:.3f}A, backing off pwm_out={}.".format(
-                    il,
-                    last_pwm_out
+                "CHARGE stopped: current went negative IL={:.3f}A. "
+                "This PWM direction discharges the capacitor, so PWM is off.".format(
+                    il
                 )
             )
             continue
