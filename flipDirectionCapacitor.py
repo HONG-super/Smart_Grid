@@ -4,7 +4,7 @@
 #
 # Commands:
 #   S        charge to V_CAP_MAX
-#   S10      charge until +10 J, stopping at voltage/current limits
+#   S10      charge to V_CAP_MAX, with +10 J shown as targetE/progress
 #   E        discharge DEFAULT_DISCHARGE_J
 #   E5       discharge 5 J
 #   H        stop, PWM off
@@ -49,7 +49,7 @@ pwm.duty_u16(0)
 led = Pin("LED", Pin.OUT)
 led.on()
 
-CODE_VERSION = "parallel_2x_0p25F_ESR4_charge0p7_discharge0p7_2026_06_08"
+CODE_VERSION = "parallel_2x_0p25F_ESR4_active_store_to_16V_2026_06_08"
 
 
 # ============================================================
@@ -67,7 +67,7 @@ SHUNT_OHMS = 0.10
 CAP_ESR_OHMS = 2.00
 
 MIN_PWM_OUT = 0
-MAX_PWM_OUT = 65535
+MAX_PWM_OUT = 64536
 
 I_PRECHARGE_LIMIT = 0.85
 I_CHARGE_TARGET = 0.70
@@ -76,6 +76,25 @@ I_DISCHARGE_TARGET = -0.70
 I_DISCHARGE_LIMIT = -0.85
 I_HARD_LIMIT = 1.20
 CHARGE_ENERGY_LOSS_STOP_J = 0.20
+I_CHARGE_MIN_USEFUL = 0.02
+BUS_CHARGE_MARGIN_V = 0.25
+STORE_REVERSE_CURRENT_LIMIT = -0.35
+STORE_SAFE_START_PWM = 1000
+STORE_COLD_MID_PWM = 3000
+STORE_COLD_HIGH_PWM = 5600
+STORE_COLD_MID_DELTA = 0.30
+STORE_COLD_HIGH_DELTA = 0.80
+STORE_PWM_HARD_MAX_BASE = 12520
+STORE_PWM_HARD_MAX_HIGH = 30000
+STORE_HIGH_VCAP = 10.4
+STORE_PWM_GAIN = 200.0
+STORE_PWM_MAX_STEP_UP = 25.0
+STORE_PWM_MAX_STEP_UP_MID = 35.0
+STORE_PWM_MAX_STEP_UP_HIGH = 45.0
+STORE_PWM_STEP_MID_VCAP = 12.5
+STORE_PWM_STEP_HIGH_VCAP = 13.8
+STORE_PWM_MAX_STEP_DOWN = 320.0
+IL_FILTER_ALPHA = 0.20
 
 DEFAULT_CHARGE_J = 0.0
 DEFAULT_DISCHARGE_J = 5.0
@@ -85,6 +104,7 @@ CHARGE_START_PWM_OUT = MAX_PWM_OUT
 CHARGE_MIN_PWM_OUT = 64536
 CHARGE_STEP_DOWN = 1
 CHARGE_STEP_UP = 200
+CHARGE_LIMIT_PWM_OUT = 64536
 
 DISCHARGE_START_PWM_OUT = 64536
 DISCHARGE_MIN_PWM_OUT = 30000
@@ -112,6 +132,8 @@ last_energy = 0.0
 last_pwm_out = 0
 last_duty_actual = 0
 last_status_ms = 0
+duty_cmd = 0.0
+il_filtered = 0.0
 
 command = ""
 command_energy_j = DEFAULT_CHARGE_J
@@ -172,6 +194,66 @@ def write_pwm_out(pwm_out):
     last_pwm_out = pwm_out
     last_duty_actual = duty_actual
     pwm.duty_u16(duty_actual)
+
+
+def pwm_start(pwm_out):
+    global duty_cmd
+    duty_cmd = float(clamp(pwm_out, MIN_PWM_OUT, MAX_PWM_OUT))
+    write_pwm_out(duty_cmd)
+
+
+def calculate_store_start_pwm(vcap, vbus):
+    dv = vcap - vbus
+
+    if dv >= STORE_COLD_HIGH_DELTA:
+        return STORE_COLD_HIGH_PWM
+
+    if dv >= STORE_COLD_MID_DELTA:
+        return STORE_COLD_MID_PWM
+
+    return STORE_SAFE_START_PWM
+
+
+def get_store_pwm_hard_max(vcap):
+    if vcap >= STORE_HIGH_VCAP:
+        return STORE_PWM_HARD_MAX_HIGH
+
+    return STORE_PWM_HARD_MAX_BASE
+
+
+def get_store_pwm_step_up(vcap):
+    if vcap >= STORE_PWM_STEP_HIGH_VCAP:
+        return STORE_PWM_MAX_STEP_UP_HIGH
+
+    if vcap >= STORE_PWM_STEP_MID_VCAP:
+        return STORE_PWM_MAX_STEP_UP_MID
+
+    return STORE_PWM_MAX_STEP_UP
+
+
+def store_control_step(vcap, il):
+    global duty_cmd, il_filtered
+
+    il_filtered = (
+        (1.0 - IL_FILTER_ALPHA) * il_filtered
+        + IL_FILTER_ALPHA * il
+    )
+
+    err = I_CHARGE_TARGET - il_filtered
+    raw_step = STORE_PWM_GAIN * err
+
+    if raw_step >= 0.0:
+        pwm_step = clamp(raw_step, 0.0, get_store_pwm_step_up(vcap))
+    else:
+        pwm_step = clamp(raw_step, -STORE_PWM_MAX_STEP_DOWN, 0.0)
+
+    duty_cmd = clamp(
+        duty_cmd + pwm_step,
+        MIN_PWM_OUT,
+        get_store_pwm_hard_max(vcap)
+    )
+
+    write_pwm_out(duty_cmd)
 
 
 def parse_energy_amount(text, default_value):
@@ -247,7 +329,7 @@ def do_stop():
 
 
 def start_charge(request_j):
-    global mode, target_energy_j, start_energy_j
+    global mode, target_energy_j, start_energy_j, il_filtered
 
     if trip:
         print("Trip active. Send H first.")
@@ -290,18 +372,27 @@ def start_charge(request_j):
         )
         return
 
-    write_pwm_out(CHARGE_START_PWM_OUT)
     start_energy_j = last_energy
     target_energy_j = request_j
-    mode = "CHARGE"
+    il_filtered = last_il
+
+    if last_vcap < last_vbus - BUS_CHARGE_MARGIN_V:
+        pwm_off()
+        mode = "CHARGE_PASSIVE"
+        start_text = "PWM off natural charge until near bus, then ACTIVE_STORE"
+    else:
+        pwm_start(calculate_store_start_pwm(last_vcap, last_vbus))
+        mode = "ACTIVE_STORE"
+        start_text = "ACTIVE_STORE started now"
 
     print(
         "CHARGE started: Vcap={:.3f}V -> {:.3f}V, "
-        "target +{:.3f}J, current target {:.3f}A.".format(
+        "target +{:.3f}J, current target {:.3f}A. {}.".format(
             last_vcap,
             V_CAP_MAX,
             target_energy_j,
-            I_CHARGE_TARGET
+            I_CHARGE_TARGET,
+            start_text
         )
     )
 
@@ -437,6 +528,7 @@ print("Simple capacitor controller ready.")
 print("Code version:", CODE_VERSION)
 print("A port = DC bus, B port = capacitor.")
 print("Commands: S, S10, E, E5, H, P")
+print("Charge commands always continue to Vcap=16V unless protection stops.")
 print("PWM convention: duty_actual = 65536 - pwm_out.")
 print("Capacitor pack: 2 parallel caps, each 0.25F and 4ohm ESR.")
 print(
@@ -453,20 +545,21 @@ print(
     )
 )
 print(
-    "CHARGE: S or S10, target {:.3f}A, voltage target {:.3f}V, current limit {:.3f}A.".format(
-        I_CHARGE_TARGET,
+    "CHARGE: S or S10, passive to bus then ACTIVE_STORE to {:.3f}V, current target {:.3f}A.".format(
         V_CAP_MAX,
-        I_PRECHARGE_LIMIT
+        I_CHARGE_TARGET,
     )
 )
 print(
-    "CHARGE protection: stop and PWM off if IL <= {:.3f}A.".format(
-        I_CHARGE_REVERSE_STOP
+    "ACTIVE_STORE: start PWM 1000/3000/5600, high-voltage ceiling {}, reverse trip {:.3f}A.".format(
+        STORE_PWM_HARD_MAX_HIGH,
+        STORE_REVERSE_CURRENT_LIMIT
     )
 )
 print(
-    "CHARGE protection: stop if dE <= -{:.3f}J.".format(
-        CHARGE_ENERGY_LOSS_STOP_J
+    "PASSIVE->ACTIVE switch: Vcap within {:.3f}V of bus or IL < {:.3f}A.".format(
+        BUS_CHARGE_MARGIN_V,
+        I_CHARGE_MIN_USEFUL
     )
 )
 print(
@@ -525,7 +618,7 @@ while True:
         command = ""
         start_discharge(command_energy_j)
 
-    if not trip and mode == "CHARGE":
+    if not trip and (mode == "CHARGE_PASSIVE" or mode == "ACTIVE_STORE"):
 
         if abs(il) >= I_HARD_LIMIT:
             do_trip("hard overcurrent during charge {:.3f}A".format(il))
@@ -546,28 +639,6 @@ while True:
             pwm_off()
             continue
 
-        if energy - start_energy_j <= -CHARGE_ENERGY_LOSS_STOP_J:
-            print(
-                "CHARGE stopped: capacitor energy is falling, dE={:.3f}J. "
-                "PWM off.".format(
-                    energy - start_energy_j
-                )
-            )
-            mode = "STOPPED"
-            pwm_off()
-            continue
-
-        if target_energy_j > 0.0 and energy - start_energy_j >= target_energy_j:
-            print(
-                "CHARGE target done: dE={:.3f}J Vcap={:.3f}V. PWM off.".format(
-                    energy - start_energy_j,
-                    vcap
-                )
-            )
-            mode = "STOPPED"
-            pwm_off()
-            continue
-
         if vcap >= V_CAP_MAX:
             print(
                 "CHARGE stopped: Vcap={:.3f}V reached limit {:.3f}V. "
@@ -582,35 +653,47 @@ while True:
             pwm_off()
             continue
 
-        if il >= I_PRECHARGE_LIMIT:
-            next_pwm = last_pwm_out + CHARGE_STEP_UP
-            write_pwm_out(next_pwm)
-            print(
-                "Charge current too high: IL={:.3f}A, backing off pwm_out={}.".format(
-                    il,
-                    last_pwm_out
+        if mode == "CHARGE_PASSIVE":
+            if il >= I_PRECHARGE_LIMIT:
+                write_pwm_out(CHARGE_LIMIT_PWM_OUT)
+                print(
+                    "Passive charge current high: IL={:.3f}A, limiting with pwm_out={}.".format(
+                        il,
+                        last_pwm_out
+                    )
                 )
-            )
-            continue
+                continue
 
-        if il <= I_CHARGE_REVERSE_STOP:
-            mode = "STOPPED"
+            if vcap >= vbus - BUS_CHARGE_MARGIN_V or il < I_CHARGE_MIN_USEFUL:
+                mode = "ACTIVE_STORE"
+                il_filtered = il
+                pwm_start(calculate_store_start_pwm(vcap, vbus))
+                print(
+                    "Switching to ACTIVE_STORE: Vcap={:.3f}V Vbus={:.3f}V "
+                    "IL={:.3f}A pwm_out={} duty_actual={}".format(
+                        vcap,
+                        vbus,
+                        il,
+                        last_pwm_out,
+                        last_duty_actual
+                    )
+                )
+                continue
+
             pwm_off()
-            print(
-                "CHARGE stopped: current went negative IL={:.3f}A. "
-                "This PWM direction discharges the capacitor, so PWM is off.".format(
-                    il
+
+        elif mode == "ACTIVE_STORE":
+            if il <= STORE_REVERSE_CURRENT_LIMIT:
+                do_trip(
+                    "active store reverse current {:.3f}A at pwm_out={} duty_actual={}".format(
+                        il,
+                        last_pwm_out,
+                        last_duty_actual
+                    )
                 )
-            )
-            continue
+                continue
 
-        if il < I_CHARGE_TARGET:
-            next_pwm = last_pwm_out - CHARGE_STEP_DOWN
-            write_pwm_out(max(next_pwm, CHARGE_MIN_PWM_OUT))
-
-        else:
-            next_pwm = last_pwm_out + CHARGE_STEP_UP
-            write_pwm_out(min(next_pwm, CHARGE_START_PWM_OUT))
+            store_control_step(vcap, il)
 
     if not trip and mode == "DISCHARGE":
 
