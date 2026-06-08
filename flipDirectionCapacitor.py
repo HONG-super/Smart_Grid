@@ -1,10 +1,10 @@
 # Simple Supercapacitor Controller
 # A port = DC bus, B port = capacitor
-# This file is intentionally small: safe low-voltage precharge first.
+# This file is intentionally small: active low-current charge/discharge first.
 #
 # Commands:
-#   S        precharge to PRECHARGE_TARGET_V
-#   S10      precharge, then keep passive charging until +10 J if possible
+#   S        charge to PRECHARGE_TARGET_V
+#   S10      charge until +10 J, stopping at voltage/current limits
 #   E        discharge DEFAULT_DISCHARGE_J
 #   E5       discharge 5 J
 #   H        stop, PWM off
@@ -16,7 +16,7 @@
 #
 # Important:
 #   pwm_off() uses pwm.duty_u16(0), not duty_actual = 0.
-#   This is the condition that your log showed naturally precharging the cap.
+#   pwm_out starts near MAX_PWM_OUT and moves slowly.
 
 from machine import Pin, I2C, ADC, PWM, Timer
 import time
@@ -68,7 +68,8 @@ MIN_PWM_OUT = 0
 MAX_PWM_OUT = 64536
 
 I_PRECHARGE_LIMIT = 0.45
-I_REVERSE_LIMIT = -0.08
+I_CHARGE_TARGET = 0.10
+I_REVERSE_LIMIT = -0.45
 I_DISCHARGE_TARGET = -0.10
 I_DISCHARGE_LIMIT = -0.45
 I_HARD_LIMIT = 1.20
@@ -76,6 +77,11 @@ I_HARD_LIMIT = 1.20
 DEFAULT_CHARGE_J = 0.0
 DEFAULT_DISCHARGE_J = 5.0
 STATUS_INTERVAL_MS = 1000
+
+CHARGE_START_PWM_OUT = MAX_PWM_OUT
+CHARGE_MIN_PWM_OUT = 45000
+CHARGE_STEP_DOWN = 4
+CHARGE_STEP_UP = 200
 
 DISCHARGE_START_PWM_OUT = MAX_PWM_OUT
 DISCHARGE_MIN_PWM_OUT = 30000
@@ -253,17 +259,18 @@ def start_precharge(request_j):
         )
         return
 
-    pwm_off()
+    write_pwm_out(CHARGE_START_PWM_OUT)
     start_energy_j = last_energy
     target_energy_j = request_j
     mode = "PRECHARGE"
 
     print(
-        "PRECHARGE started: PWM off, Vcap={:.3f}V -> {:.3f}V, "
-        "followup target +{:.3f}J if passive charging can reach it.".format(
+        "CHARGE started: Vcap={:.3f}V -> {:.3f}V, "
+        "target +{:.3f}J, current target {:.3f}A.".format(
             last_vcap,
             PRECHARGE_TARGET_V,
-            target_energy_j
+            target_energy_j,
+            I_CHARGE_TARGET
         )
     )
 
@@ -398,9 +405,10 @@ loop_timer = Timer(
 print("Simple capacitor controller ready.")
 print("A port = DC bus, B port = capacitor.")
 print("Commands: S, S10, E, E5, H, P")
-print("PWM convention: duty_actual = 65536 - pwm_out, but PRECHARGE uses PWM off.")
+print("PWM convention: duty_actual = 65536 - pwm_out.")
 print(
-    "PRECHARGE: PWM off until Vcap >= {:.3f}V; current limit {:.3f}A.".format(
+    "CHARGE: S or S10, target {:.3f}A, voltage target {:.3f}V, current limit {:.3f}A.".format(
+        I_CHARGE_TARGET,
         PRECHARGE_TARGET_V,
         I_PRECHARGE_LIMIT
     )
@@ -463,55 +471,75 @@ while True:
 
     if not trip and mode == "PRECHARGE":
 
-        # PRECHARGE deliberately keeps PWM off. Your observed hardware already
-        # charges the capacitor gently in this state.
-        pwm_off()
-
         if abs(il) >= I_HARD_LIMIT:
-            do_trip("hard overcurrent during precharge {:.3f}A".format(il))
+            do_trip("hard overcurrent during charge {:.3f}A".format(il))
             continue
 
-        if abs(il) >= I_PRECHARGE_LIMIT:
-            do_trip("precharge current {:.3f}A".format(il))
+        if target_energy_j <= 0.0 and vcap >= PRECHARGE_TARGET_V:
+            print(
+                "CHARGE done: Vcap={:.3f}V E={:.3f}J. PWM off.".format(
+                    vcap,
+                    energy
+                )
+            )
+            mode = "STOPPED"
+            pwm_off()
+            continue
+
+        if target_energy_j > 0.0 and energy - start_energy_j >= target_energy_j:
+            print(
+                "CHARGE target done: dE={:.3f}J Vcap={:.3f}V. PWM off.".format(
+                    energy - start_energy_j,
+                    vcap
+                )
+            )
+            mode = "STOPPED"
+            pwm_off()
+            continue
+
+        if vcap >= vbus - PASSIVE_STOP_MARGIN_V:
+            print(
+                "CHARGE stopped: Vcap={:.3f}V near Vbus={:.3f}V. "
+                "dE={:.3f}J target={:.3f}J. PWM off.".format(
+                    vcap,
+                    vbus,
+                    energy - start_energy_j,
+                    target_energy_j
+                )
+            )
+            mode = "STOPPED"
+            pwm_off()
+            continue
+
+        if il >= I_PRECHARGE_LIMIT:
+            next_pwm = last_pwm_out + CHARGE_STEP_UP
+            write_pwm_out(next_pwm)
+            print(
+                "Charge current too high: IL={:.3f}A, backing off pwm_out={}.".format(
+                    il,
+                    last_pwm_out
+                )
+            )
             continue
 
         if il <= I_REVERSE_LIMIT:
-            do_trip("reverse current during precharge {:.3f}A".format(il))
+            next_pwm = last_pwm_out + CHARGE_STEP_UP
+            write_pwm_out(next_pwm)
+            print(
+                "Charge reverse current: IL={:.3f}A, backing off pwm_out={}.".format(
+                    il,
+                    last_pwm_out
+                )
+            )
             continue
 
-        if vcap >= PRECHARGE_TARGET_V:
-            if target_energy_j <= 0.0:
-                print(
-                    "PRECHARGE done: Vcap={:.3f}V E={:.3f}J. PWM off.".format(
-                        vcap,
-                        energy
-                    )
-                )
-                mode = "STOPPED"
-                pwm_off()
+        if il < I_CHARGE_TARGET:
+            next_pwm = last_pwm_out - CHARGE_STEP_DOWN
+            write_pwm_out(max(next_pwm, CHARGE_MIN_PWM_OUT))
 
-            elif energy - start_energy_j >= target_energy_j:
-                print(
-                    "Passive charge target done: dE={:.3f}J Vcap={:.3f}V. PWM off.".format(
-                        energy - start_energy_j,
-                        vcap
-                    )
-                )
-                mode = "STOPPED"
-                pwm_off()
-
-            elif vcap >= vbus - PASSIVE_STOP_MARGIN_V:
-                print(
-                    "Passive charge cannot safely continue: Vcap={:.3f}V near Vbus={:.3f}V. "
-                    "dE={:.3f}J target={:.3f}J. PWM off.".format(
-                        vcap,
-                        vbus,
-                        energy - start_energy_j,
-                        target_energy_j
-                    )
-                )
-                mode = "STOPPED"
-                pwm_off()
+        else:
+            next_pwm = last_pwm_out + CHARGE_STEP_UP
+            write_pwm_out(min(next_pwm, CHARGE_START_PWM_OUT))
 
     if not trip and mode == "DISCHARGE":
 
