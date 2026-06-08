@@ -3,7 +3,7 @@
 # This file is intentionally small: active low-current charge/discharge first.
 #
 # Commands:
-#   S        charge to PRECHARGE_TARGET_V
+#   S        charge to V_CAP_MAX
 #   S10      charge until +10 J, stopping at voltage/current limits
 #   E        discharge DEFAULT_DISCHARGE_J
 #   E5       discharge 5 J
@@ -49,20 +49,22 @@ pwm.duty_u16(0)
 led = Pin("LED", Pin.OUT)
 led.on()
 
+CODE_VERSION = "cap_4V_16V_ESR_2ohm_2026_06_08"
+
 
 # ============================================================
 # Parameters
 # ============================================================
 
 V_BUS_MIN = 8.0
-V_CAP_ABSOLUTE_MIN = 0.8
-PRECHARGE_TARGET_V = 8.0
-DISCHARGE_STOP_V = 8.0
-PASSIVE_STOP_MARGIN_V = 0.25
+V_CAP_MIN = 4.0
+V_CAP_MAX = 16.0
+V_TERM_HARD_MIN = 0.5
+V_TERM_HARD_MAX = 18.0
 
 C_FARADS = 1.5
 SHUNT_OHMS = 0.10
-CAP_ESR_OHMS = 0.30
+CAP_ESR_OHMS = 2.00
 
 MIN_PWM_OUT = 0
 MAX_PWM_OUT = 64536
@@ -143,6 +145,18 @@ def energy_from_vcap(vcap):
     return 0.5 * C_FARADS * vcap * vcap
 
 
+def energy_at_voltage(voltage):
+    return 0.5 * C_FARADS * voltage * voltage
+
+
+def usable_energy(vcap):
+    return max(0.0, energy_from_vcap(vcap) - energy_at_voltage(V_CAP_MIN))
+
+
+def remaining_energy_space(vcap):
+    return max(0.0, energy_at_voltage(V_CAP_MAX) - energy_from_vcap(vcap))
+
+
 def pwm_off():
     global last_pwm_out, last_duty_actual
     last_pwm_out = 0
@@ -183,9 +197,13 @@ def parse_energy_amount(text, default_value):
 
 
 def print_status():
+    usable_j = usable_energy(last_vcap)
+    space_j = remaining_energy_space(last_vcap)
+
     print(
         "mode={} trip={} Vbus={:.3f}V Vterm={:.3f}V Vcap={:.3f}V "
-        "IL={:.3f}A E={:.3f}J dE={:.3f}J targetE={:.3f}J "
+        "IL={:.3f}A E={:.3f}J usable={:.3f}J space={:.3f}J "
+        "dE={:.3f}J targetE={:.3f}J "
         "pwm_out={} duty_actual={}".format(
             mode,
             trip,
@@ -194,6 +212,8 @@ def print_status():
             last_vcap,
             last_il,
             last_energy,
+            usable_j,
+            space_j,
             last_energy - start_energy_j,
             target_energy_j,
             last_pwm_out,
@@ -225,18 +245,28 @@ def do_stop():
     print("Stopped. PWM off.")
 
 
-def start_precharge(request_j):
+def start_charge(request_j):
     global mode, target_energy_j, start_energy_j
 
     if trip:
         print("Trip active. Send H first.")
         return
 
-    if last_vcap < V_CAP_ABSOLUTE_MIN:
+    if last_vterm < V_TERM_HARD_MIN or last_vterm > V_TERM_HARD_MAX:
         print(
-            "Start blocked: Vcap={:.3f}V below {:.3f}V. Check sensing/wiring.".format(
+            "Start blocked: Vterm={:.3f}V outside hard sensing range {:.3f}-{:.3f}V.".format(
+                last_vterm,
+                V_TERM_HARD_MIN,
+                V_TERM_HARD_MAX
+            )
+        )
+        return
+
+    if last_vcap >= V_CAP_MAX:
+        print(
+            "Charge blocked: Vcap={:.3f}V already at/above {:.3f}V.".format(
                 last_vcap,
-                V_CAP_ABSOLUTE_MIN
+                V_CAP_MAX
             )
         )
         return
@@ -262,13 +292,13 @@ def start_precharge(request_j):
     write_pwm_out(CHARGE_START_PWM_OUT)
     start_energy_j = last_energy
     target_energy_j = request_j
-    mode = "PRECHARGE"
+    mode = "CHARGE"
 
     print(
         "CHARGE started: Vcap={:.3f}V -> {:.3f}V, "
         "target +{:.3f}J, current target {:.3f}A.".format(
             last_vcap,
-            PRECHARGE_TARGET_V,
+            V_CAP_MAX,
             target_energy_j,
             I_CHARGE_TARGET
         )
@@ -286,11 +316,11 @@ def start_discharge(request_j):
         print("Invalid discharge amount. Use E or E5.")
         return
 
-    if last_vcap <= DISCHARGE_STOP_V:
+    if last_vcap <= V_CAP_MIN:
         print(
             "Discharge blocked: Vcap={:.3f}V is already at/below {:.3f}V.".format(
                 last_vcap,
-                DISCHARGE_STOP_V
+                V_CAP_MIN
             )
         )
         return
@@ -313,7 +343,7 @@ def start_discharge(request_j):
         "DISCHARGE started: target -{:.3f}J, stop at Vcap <= {:.3f}V, "
         "current target {:.3f}A.".format(
             target_energy_j,
-            DISCHARGE_STOP_V,
+            V_CAP_MIN,
             I_DISCHARGE_TARGET
         )
     )
@@ -403,20 +433,28 @@ loop_timer = Timer(
 )
 
 print("Simple capacitor controller ready.")
+print("Code version:", CODE_VERSION)
 print("A port = DC bus, B port = capacitor.")
 print("Commands: S, S10, E, E5, H, P")
 print("PWM convention: duty_actual = 65536 - pwm_out.")
 print(
+    "Cap limits use ESR-corrected Vcap: {:.3f}V to {:.3f}V, ESR={:.3f}ohm.".format(
+        V_CAP_MIN,
+        V_CAP_MAX,
+        CAP_ESR_OHMS
+    )
+)
+print(
     "CHARGE: S or S10, target {:.3f}A, voltage target {:.3f}V, current limit {:.3f}A.".format(
         I_CHARGE_TARGET,
-        PRECHARGE_TARGET_V,
+        V_CAP_MAX,
         I_PRECHARGE_LIMIT
     )
 )
 print(
     "DISCHARGE: E or E5, target {:.3f}A, stop at {:.3f}V, current limit {:.3f}A.".format(
         I_DISCHARGE_TARGET,
-        DISCHARGE_STOP_V,
+        V_CAP_MIN,
         I_DISCHARGE_LIMIT
     )
 )
@@ -463,19 +501,23 @@ while True:
 
     elif command == "S":
         command = ""
-        start_precharge(command_energy_j)
+        start_charge(command_energy_j)
 
     elif command == "E":
         command = ""
         start_discharge(command_energy_j)
 
-    if not trip and mode == "PRECHARGE":
+    if not trip and mode == "CHARGE":
 
         if abs(il) >= I_HARD_LIMIT:
             do_trip("hard overcurrent during charge {:.3f}A".format(il))
             continue
 
-        if target_energy_j <= 0.0 and vcap >= PRECHARGE_TARGET_V:
+        if vterm >= V_TERM_HARD_MAX:
+            do_trip("terminal overvoltage during charge {:.3f}V".format(vterm))
+            continue
+
+        if target_energy_j <= 0.0 and vcap >= V_CAP_MAX:
             print(
                 "CHARGE done: Vcap={:.3f}V E={:.3f}J. PWM off.".format(
                     vcap,
@@ -497,12 +539,12 @@ while True:
             pwm_off()
             continue
 
-        if vcap >= vbus - PASSIVE_STOP_MARGIN_V:
+        if vcap >= V_CAP_MAX:
             print(
-                "CHARGE stopped: Vcap={:.3f}V near Vbus={:.3f}V. "
+                "CHARGE stopped: Vcap={:.3f}V reached limit {:.3f}V. "
                 "dE={:.3f}J target={:.3f}J. PWM off.".format(
                     vcap,
-                    vbus,
+                    V_CAP_MAX,
                     energy - start_energy_j,
                     target_energy_j
                 )
@@ -547,6 +589,10 @@ while True:
             do_trip("hard overcurrent during discharge {:.3f}A".format(il))
             continue
 
+        if vterm <= V_TERM_HARD_MIN:
+            do_trip("terminal undervoltage during discharge {:.3f}V".format(vterm))
+            continue
+
         discharged_j = start_energy_j - energy
 
         if discharged_j >= target_energy_j:
@@ -560,12 +606,12 @@ while True:
             pwm_off()
             continue
 
-        if vcap <= DISCHARGE_STOP_V:
+        if vcap <= V_CAP_MIN:
             print(
                 "DISCHARGE stopped: Vcap={:.3f}V reached limit {:.3f}V. "
                 "dE=-{:.3f}J target=-{:.3f}J. PWM off.".format(
                     vcap,
-                    DISCHARGE_STOP_V,
+                    V_CAP_MIN,
                     discharged_j,
                     target_energy_j
                 )
