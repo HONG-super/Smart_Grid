@@ -2,7 +2,7 @@
 # Hardware: 0.5 F cap, Vbus = 10.0 V
 # WARNING: this is a test version with opened STORE PWM ceiling. Use PSU current limit.
 # Commands: S[J]=store  E[J]=extract  U=maintain  H=stop  P=print  C=40s CSV log
-# Version: v25 B-port capacitor wiring
+# Version: v27 B-port capacitor wiring, bidirectional PWM convention
 # Main changes:
 # 1) Raise high-voltage STORE ceiling to 15000 because 14000 still limited current near 12 V.
 # 2) Use voltage-based SAFE_HOLD / recovery so EXTRACT handover does not keep discharging.
@@ -14,7 +14,9 @@
 # 8) v22: faster STORE PWM ramp above 12.5 V / 13.8 V to improve high-voltage charging speed.
 # 9) v23: status auto-print reduced to 1 Hz to reduce serial load.
 # 10) v24: correct measured terminal voltage for 2 ohm effective capacitor ESR.
-# 11) v25: capacitor moved to B port, DC bus moved to A port, active PWM inverted.
+# 11) v25: capacitor moved to B port, DC bus moved to A port.
+# 12) v26: keep direct PWM command mapping; controller thresholds are tuned in direct PWM units.
+# 13) v27: use provided bidirectional code convention: duty_actual = 65536 - pwm_out.
 
 from machine import Pin, I2C, ADC, PWM, Timer
 import time
@@ -43,7 +45,7 @@ ina_i2c = I2C(
 pwm = PWM(Pin(9))
 pwm.freq(100000)
 
-MIN_PWM = 1000
+MIN_PWM = 0
 MAX_PWM = 64536
 
 duty = 0
@@ -117,6 +119,9 @@ V_BUS_PRECHARGE_MIN = 8.0
 VCAP_PRECHARGE_MIN = 0.8
 PRECHARGE_TARGET_V = VCAP_MIN
 PRECHARGE_PWM_HARD_MAX = 12520
+PRECHARGE_START_PWM = 0
+PRECHARGE_PWM_MAX_STEP_UP = 2.0
+PRECHARGE_PWM_MAX_STEP_DOWN = 80.0
 
 
 # ============================================================
@@ -361,10 +366,10 @@ def correct_vcap_for_esr(v_terminal, cap_current):
 def write_active_pwm(command_pwm):
     global last_pwm_actual
 
-    # The bidirectional reference code drives the hardware with inverted PWM.
-    actual_pwm = int(clamp(65536 - int(command_pwm), 0, 65535))
-    last_pwm_actual = actual_pwm
-    pwm.duty_u16(actual_pwm)
+    pwm_out = int(clamp(command_pwm, MIN_PWM, MAX_PWM))
+    duty_actual = int(clamp(65536 - pwm_out, 0, 65535))
+    last_pwm_actual = duty_actual
+    pwm.duty_u16(duty_actual)
 
 
 def reset_pid():
@@ -910,7 +915,7 @@ def start_csv_log():
         csv_file.write(
             "time_ms,elapsed_ms,mode,trip,hard_stopped,"
             "action_in_progress,Vbus,Vterm,Vcap,IL,IL_filtered,E,E_delta,"
-            "SoC,I_target,duty,pwm_command,pwm_actual\n"
+            "SoC,I_target,pwm_out,duty_actual\n"
         )
         csv_file.flush()
 
@@ -973,7 +978,7 @@ def update_csv_log(now_ms, vbus, va_terminal, va, IL, E, SoC):
     try:
         csv_file.write(
             "{},{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},"
-            "{:.4f},{:.4f},{:.2f},{:.4f},{},{},{}\n".format(
+            "{:.4f},{:.4f},{:.2f},{:.4f},{},{}\n".format(
                 now_ms,
                 elapsed_ms,
                 mode,
@@ -989,7 +994,6 @@ def update_csv_log(now_ms, vbus, va_terminal, va, IL, E, SoC):
                 E_delta,
                 SoC,
                 I_target,
-                duty,
                 last_pwm_applied,
                 last_pwm_actual
             )
@@ -1071,7 +1075,7 @@ def print_status():
         "mode={} trip={} Vbus={:.3f}V Vterm={:.3f}V Vcap={:.3f}V IL={:.3f}A "
         "E={:.3f}J Espace={:.3f}J Eout={:.3f}J "
         "dE={:.3f}J SoC={:.1f}% target={:.3f}A "
-        "duty={} pwm_cmd={} pwm_actual={} t={:.3f}s".format(
+        "pwm_out={} duty_actual={} t={:.3f}s".format(
             mode,
             trip,
             last_vbus,
@@ -1084,7 +1088,6 @@ def print_status():
             E_delta,
             last_SoC,
             I_target,
-            duty,
             last_pwm_applied,
             last_pwm_actual,
             elapsed_s
@@ -1114,7 +1117,7 @@ print("Ready. Commands: S[J] E[J] U H P C")
 print("Examples: S8 charges 8J, E3.5 extracts 3.5J. S/E alone use default.")
 print("PWM initially OFF.")
 print("Port wiring: A port = DC bus, B port = capacitor.")
-print("Active PWM is inverted: pwm_actual = 65536 - pwm_cmd.")
+print("Active PWM uses bidirectional convention: duty_actual = 65536 - pwm_out.")
 print("ESR correction enabled: Vcap = Vterm - IL * {:.3f} ohm".format(CAP_ESR_OHMS))
 print(
     "PRECHARGE enabled: S below {:.3f}V charges at {:.3f}A until {:.3f}V; "
@@ -1215,10 +1218,35 @@ while True:
     if (
         not trip
         and not hard_stopped
-        and (mode == "STORE" or mode == "PRECHARGE")
+        and mode == "STORE"
         and IL <= STORE_REVERSE_CURRENT_LIMIT
     ):
-        do_trip("{} reverse current {:.3f}A".format(mode.lower(), IL), reverse_hold=True)
+        do_trip("store reverse current {:.3f}A".format(IL), reverse_hold=True)
+        continue
+
+    if (
+        not trip
+        and not hard_stopped
+        and mode == "PRECHARGE"
+        and IL <= STORE_REVERSE_CURRENT_LIMIT
+    ):
+        if abs(IL) >= I_LIMIT:
+            do_trip("precharge reverse overcurrent {:.3f}A".format(IL), reverse_hold=True)
+            continue
+
+        duty = PRECHARGE_START_PWM
+        duty_cmd = float(duty)
+        last_pwm_applied = duty
+        write_active_pwm(last_pwm_applied)
+        IL_filtered = IL
+
+        print(
+            "PRECHARGE reverse current {:.3f}A: holding at start PWM {}. "
+            "If this repeats, current sign or power path direction is wrong.".format(
+                IL,
+                PRECHARGE_START_PWM
+            )
+        )
         continue
 
     if (
@@ -1372,7 +1400,7 @@ while True:
             print("Already at max energy ({:.3f}J).".format(E))
 
         elif va < VCAP_STORE_MIN:
-            start_pwm = calculate_store_warm_start_pwm(va)
+            start_pwm = PRECHARGE_START_PWM
 
             if hard_stopped:
                 pwm_start(start_pwm)
@@ -1674,15 +1702,25 @@ while True:
             raw_step = STORE_PWM_GAIN * err
 
             if raw_step >= 0:
+                if mode == "PRECHARGE":
+                    max_step_up = PRECHARGE_PWM_MAX_STEP_UP
+                else:
+                    max_step_up = get_store_pwm_step_up(va)
+
                 pwm_step = clamp(
                     raw_step,
                     0.0,
-                    get_store_pwm_step_up(va)
+                    max_step_up
                 )
             else:
+                if mode == "PRECHARGE":
+                    max_step_down = PRECHARGE_PWM_MAX_STEP_DOWN
+                else:
+                    max_step_down = STORE_PWM_MAX_STEP_DOWN
+
                 pwm_step = clamp(
                     raw_step,
-                    -STORE_PWM_MAX_STEP_DOWN,
+                    -max_step_down,
                     0.0
                 )
 
