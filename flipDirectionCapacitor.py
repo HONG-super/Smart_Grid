@@ -118,10 +118,8 @@ I_LIMIT    =  1.20          # Hard overcurrent trip limit, A
 V_BUS_PRECHARGE_MIN = 8.0
 VCAP_PRECHARGE_MIN = 0.8
 PRECHARGE_TARGET_V = VCAP_MIN
-PRECHARGE_PWM_HARD_MAX = 12520
-PRECHARGE_START_PWM = 0
-PRECHARGE_PWM_MAX_STEP_UP = 2.0
-PRECHARGE_PWM_MAX_STEP_DOWN = 80.0
+PRECHARGE_START_PWM = MAX_PWM
+PRECHARGE_CURRENT_LIMIT = 0.40
 
 
 # ============================================================
@@ -554,7 +552,7 @@ def enter_safe_hold(reason):
     global action_in_progress, mode, I_target
     global duty, duty_cmd, last_pwm_applied, hard_stopped, IL_filtered
 
-    recovery_pwm = calculate_safe_recovery_pwm(last_va)
+    recovery_pwm = MAX_PWM
 
     if not trip:
         print("TRIP:", reason)
@@ -1122,7 +1120,7 @@ print("ESR correction enabled: Vcap = Vterm - IL * {:.3f} ohm".format(CAP_ESR_OH
 print(
     "PRECHARGE enabled: S below {:.3f}V charges at {:.3f}A until {:.3f}V; "
     "requires Vbus >= {:.3f}V.".format(
-        VCAP_STORE_MIN,
+        PRECHARGE_TARGET_V,
         I_PRECHARGE,
         PRECHARGE_TARGET_V,
         V_BUS_PRECHARGE_MIN
@@ -1228,25 +1226,9 @@ while True:
         not trip
         and not hard_stopped
         and mode == "PRECHARGE"
-        and IL <= STORE_REVERSE_CURRENT_LIMIT
+        and abs(IL) >= PRECHARGE_CURRENT_LIMIT
     ):
-        if abs(IL) >= I_LIMIT:
-            do_trip("precharge reverse overcurrent {:.3f}A".format(IL), reverse_hold=True)
-            continue
-
-        duty = PRECHARGE_START_PWM
-        duty_cmd = float(duty)
-        last_pwm_applied = duty
-        write_active_pwm(last_pwm_applied)
-        IL_filtered = IL
-
-        print(
-            "PRECHARGE reverse current {:.3f}A: holding at start PWM {}. "
-            "If this repeats, current sign or power path direction is wrong.".format(
-                IL,
-                PRECHARGE_START_PWM
-            )
-        )
+        do_trip("precharge current {:.3f}A".format(IL), reverse_hold=True)
         continue
 
     if (
@@ -1376,7 +1358,7 @@ while True:
                 )
             )
 
-        elif va < VCAP_STORE_MIN and vbus < V_BUS_PRECHARGE_MIN:
+        elif va < PRECHARGE_TARGET_V and vbus < V_BUS_PRECHARGE_MIN:
             print(
                 "PRECHARGE blocked: Vbus={:.3f}V below {:.3f}V. "
                 "Check A port DC bus supply.".format(
@@ -1385,7 +1367,15 @@ while True:
                 )
             )
 
-        elif hard_stopped and abs(IL) > STOPPED_CURRENT_BLOCK_STORE:
+        elif (
+            hard_stopped
+            and abs(IL) > STOPPED_CURRENT_BLOCK_STORE
+            and not (
+                va < PRECHARGE_TARGET_V
+                and IL >= 0.0
+                and IL < PRECHARGE_CURRENT_LIMIT
+            )
+        ):
             print(
                 "STORE blocked: current is already flowing while PWM is OFF. "
                 "IL={:.3f}A, limit={:.3f}A. This is a hardware/power-path "
@@ -1399,14 +1389,14 @@ while True:
         elif E >= E_MAX - 0.05:
             print("Already at max energy ({:.3f}J).".format(E))
 
-        elif va < VCAP_STORE_MIN:
+        elif va < PRECHARGE_TARGET_V:
             start_pwm = PRECHARGE_START_PWM
 
             if hard_stopped:
                 pwm_start(start_pwm)
                 store_start_type = "cold"
             else:
-                duty = int(clamp(start_pwm, MIN_PWM, PRECHARGE_PWM_HARD_MAX))
+                duty = int(clamp(start_pwm, MIN_PWM, MAX_PWM))
                 duty_cmd = float(duty)
                 last_pwm_applied = duty
                 write_active_pwm(last_pwm_applied)
@@ -1681,7 +1671,17 @@ while True:
 
     if control_allowed:
 
-        if mode == "STORE" or mode == "PRECHARGE":
+        if mode == "PRECHARGE":
+            IL_filtered = (
+                (1.0 - IL_FILTER_ALPHA) * IL_filtered
+                + IL_FILTER_ALPHA * IL
+            )
+
+            duty_cmd = float(PRECHARGE_START_PWM)
+            duty = int(duty_cmd)
+
+
+        elif mode == "STORE":
 
             # ------------------------------------------------
             # SAFE STORE controller
@@ -1702,37 +1702,22 @@ while True:
             raw_step = STORE_PWM_GAIN * err
 
             if raw_step >= 0:
-                if mode == "PRECHARGE":
-                    max_step_up = PRECHARGE_PWM_MAX_STEP_UP
-                else:
-                    max_step_up = get_store_pwm_step_up(va)
-
                 pwm_step = clamp(
                     raw_step,
                     0.0,
-                    max_step_up
+                    get_store_pwm_step_up(va)
                 )
             else:
-                if mode == "PRECHARGE":
-                    max_step_down = PRECHARGE_PWM_MAX_STEP_DOWN
-                else:
-                    max_step_down = STORE_PWM_MAX_STEP_DOWN
-
                 pwm_step = clamp(
                     raw_step,
-                    -max_step_down,
+                    -STORE_PWM_MAX_STEP_DOWN,
                     0.0
                 )
-
-            if mode == "PRECHARGE":
-                store_pwm_max = PRECHARGE_PWM_HARD_MAX
-            else:
-                store_pwm_max = get_store_pwm_hard_max(va)
 
             duty_cmd = clamp(
                 duty_cmd + pwm_step,
                 MIN_PWM,
-                store_pwm_max
+                MAX_PWM
             )
 
             duty = int(duty_cmd)
