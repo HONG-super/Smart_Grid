@@ -49,7 +49,7 @@ pwm.duty_u16(0)
 led = Pin("LED", Pin.OUT)
 led.on()
 
-CODE_VERSION = "cap_4V_16V_ESR_2ohm_charge_no_reverse_2026_06_08"
+CODE_VERSION = "parallel_2x_0p25F_ESR4_charge0p7_discharge0p7_2026_06_08"
 
 
 # ============================================================
@@ -59,22 +59,23 @@ CODE_VERSION = "cap_4V_16V_ESR_2ohm_charge_no_reverse_2026_06_08"
 V_BUS_MIN = 8.0
 V_CAP_MIN = 4.0
 V_CAP_MAX = 16.0
-V_TERM_HARD_MIN = 0.5
-V_TERM_HARD_MAX = 18.0
+V_TERM_HARD_MIN = 0.2
+V_TERM_HARD_MAX = 24.0
 
-C_FARADS = 1.5
+C_FARADS = 0.500
 SHUNT_OHMS = 0.10
 CAP_ESR_OHMS = 2.00
 
 MIN_PWM_OUT = 0
 MAX_PWM_OUT = 65535
 
-I_PRECHARGE_LIMIT = 0.45
-I_CHARGE_TARGET = 0.10
-I_CHARGE_REVERSE_STOP = -0.02
-I_DISCHARGE_TARGET = -0.10
-I_DISCHARGE_LIMIT = -0.45
+I_PRECHARGE_LIMIT = 0.85
+I_CHARGE_TARGET = 0.70
+I_CHARGE_REVERSE_STOP = -0.05
+I_DISCHARGE_TARGET = -0.70
+I_DISCHARGE_LIMIT = -0.85
 I_HARD_LIMIT = 1.20
+CHARGE_ENERGY_LOSS_STOP_J = 0.20
 
 DEFAULT_CHARGE_J = 0.0
 DEFAULT_DISCHARGE_J = 5.0
@@ -437,11 +438,18 @@ print("Code version:", CODE_VERSION)
 print("A port = DC bus, B port = capacitor.")
 print("Commands: S, S10, E, E5, H, P")
 print("PWM convention: duty_actual = 65536 - pwm_out.")
+print("Capacitor pack: 2 parallel caps, each 0.25F and 4ohm ESR.")
 print(
     "Cap limits use ESR-corrected Vcap: {:.3f}V to {:.3f}V, ESR={:.3f}ohm.".format(
         V_CAP_MIN,
         V_CAP_MAX,
         CAP_ESR_OHMS
+    )
+)
+print(
+    "Equivalent C={:.3f}F, usable window={:.3f}J.".format(
+        C_FARADS,
+        energy_at_voltage(V_CAP_MAX) - energy_at_voltage(V_CAP_MIN)
     )
 )
 print(
@@ -454,6 +462,11 @@ print(
 print(
     "CHARGE protection: stop and PWM off if IL <= {:.3f}A.".format(
         I_CHARGE_REVERSE_STOP
+    )
+)
+print(
+    "CHARGE protection: stop if dE <= -{:.3f}J.".format(
+        CHARGE_ENERGY_LOSS_STOP_J
     )
 )
 print(
@@ -527,6 +540,17 @@ while True:
                 "CHARGE done: Vcap={:.3f}V E={:.3f}J. PWM off.".format(
                     vcap,
                     energy
+                )
+            )
+            mode = "STOPPED"
+            pwm_off()
+            continue
+
+        if energy - start_energy_j <= -CHARGE_ENERGY_LOSS_STOP_J:
+            print(
+                "CHARGE stopped: capacitor energy is falling, dE={:.3f}J. "
+                "PWM off.".format(
+                    energy - start_energy_j
                 )
             )
             mode = "STOPPED"
