@@ -137,7 +137,7 @@ E_PLOT_ALPHA = 0.03
 # and control delay mean we use a higher current target. Watch board temperature.
 I_STORE    =  0.60          # Faster but safer store current target, A
 I_EXTRACT  = -0.60          # Safer extract current target, A
-I_MAINTAIN =  0.005           # Smaller maintain current target, A
+I_MAINTAIN =  0.025           # Smaller maintain current target, A
 I_LIMIT    =  1.20          # Hard overcurrent trip limit, A
 
 
