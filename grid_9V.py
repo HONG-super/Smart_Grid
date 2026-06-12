@@ -38,7 +38,7 @@ kp = 150
 ki = 300
 
 # Changed from 7.05 V to 10.00 V
-v_ref = 9.00
+v_ref = 10.00
 
 v_err = 0.0
 v_err_int = 0.0
