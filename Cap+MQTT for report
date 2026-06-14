@@ -1,4 +1,3 @@
-
 from machine import Pin, I2C, ADC, PWM, Timer
 import time
 try:
@@ -44,32 +43,36 @@ pwm.duty_u16(0)
 led = Pin("LED", Pin.OUT)
 led.on()
 
-# ============================================================
-# WiFi / MQTT settings
-# ============================================================
 
-WIFI_ENABLED = True
+# WiFi&MQTT settings
+
 WIFI_SSID = "Hong"
 WIFI_PASSWORD = "abcdefgh"
+
 MQTT_ENABLED = True
 MQTT_BROKER = "172.20.10.4"
 MQTT_PORT = 1884
 MQTT_CLIENT_ID = b"team01_supercap"
+
 MQTT_TOPIC_COMMAND = b"smartgrid/team01/supercap/command"
 MQTT_TOPIC_TELEMETRY = b"smartgrid/team01/supercap/telemetry"
 MQTT_TOPIC_EMERGENCY = b"smartgrid/team01/system/emergency"
 MQTT_TOPIC_RESTART = b"smartgrid/team01/system/restart"
-MQTT_RECONNECT_INTERVAL_MS = 5000
-MQTT_POLL_INTERVAL_MS = 50
-MQTT_TELEMETRY_INTERVAL_MS = 500
-wlan = None
+
+MQTT_RETRY_MS = 5000
+MQTT_POLL_MS = 50
+MQTT_PUBLISH_MS = 500
+
+if network is not None:
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+else:
+    wlan = None
+
 mqtt_client = None
-mqtt_connected = False
-last_mqtt_reconnect_ms = 0
+last_mqtt_retry_ms = 0
 last_mqtt_poll_ms = 0
-last_mqtt_pub_ms = 0
-last_led_toggle_ms = 0
-led_state = 1
+last_mqtt_publish_ms = 0
 
 # ============================================================
 # Controller parameters
@@ -500,222 +503,134 @@ def parse_energy_amount(text):
     return value
 
 
-# ============================================================
-# WiFi / MQTT helper functions
-# ============================================================
-
-def mqtt_decode_payload(payload):
-    try:
-        if isinstance(payload, bytes):
-            return payload.decode().strip()
-        return str(payload).strip()
-    except:
-        return ""
-
+# WiFi&MQTT
 def mqtt_set_command(cmd, energy=None):
     global command, command_energy_j
+
     cmd = cmd.upper().strip()
+
     if cmd in ("S", "E"):
         if energy is not None:
             command_energy_j = energy
         command = cmd
+
     elif cmd in ("U", "H"):
         command = cmd
 
-def mqtt_number_to_command(value):
-    try:
-        p = float(value)
-    except:
-        return
-    if abs(p) < 0.001:
-        mqtt_set_command("U")
-        return
-    energy = abs(p) * (STORE_TIME_MS / 1000.0)
-    if p > 0:
-        mqtt_set_command("S", energy)
-    else:
-        mqtt_set_command("E", energy)
-
-def mqtt_parse_command_payload(payload_text):
-    """
-    Accepted examples:
-    Raw text:
-      S10
-      E5
-      U
-      H
-      store
-      extract
-      maintain
-      stop
-      3.0      -> STORE power_ref_w=3W for 5s
-      -2.0     -> EXTRACT power_ref_w=2W for 5s
-    JSON:
-      {"command":"store","energy_j":10}
-      {"command":"extract","energy_j":5}
-      {"command":"maintain"}
-      {"command":"stop"}
-      {"command":"set_mode","mode":"charge","energy_j":10}
-      {"command":"set_mode","mode":"discharge","energy_j":5}
-      {"power_ref_w":3.0}
-      {"power_ref_w":-2.0}
-    """
-    text = payload_text.strip()
-    if not text:
-        return
-    first = text[0].upper()
-    if first in ("S", "E"):
-        amount = parse_energy_amount(text[1:])
-        if amount is None:
-            print("MQTT invalid energy command:", text)
-            return
-        mqtt_set_command(first, amount)
-        print("MQTT command -> {}{:.3f}J".format(first, amount))
-        return
-    if text.upper() in ("U", "H"):
-        mqtt_set_command(text.upper())
-        print("MQTT command ->", text.upper())
-        return
-    try:
-        value = float(text)
-        mqtt_number_to_command(value)
-        print("MQTT power_ref_w ->", value)
-        return
-    except:
-        pass
-    data = None
-    if json is not None and text.startswith("{"):
-        try:
-            data = json.loads(text)
-        except Exception as e:
-            print("MQTT JSON parse error:", e)
-            return
-    if data is None:
-        word = text.lower()
-        if word in ("store", "charge", "charging"):
-            mqtt_set_command("S", E_STEP)
-            print("MQTT command -> STORE default {:.3f}J".format(E_STEP))
-        elif word in ("extract", "discharge", "discharging"):
-            mqtt_set_command("E", E_STEP)
-            print("MQTT command -> EXTRACT default {:.3f}J".format(E_STEP))
-        elif word in ("maintain", "hold", "float"):
-            mqtt_set_command("U")
-            print("MQTT command -> MAINTAIN")
-        elif word in ("stop", "off", "halt", "emergency_stop"):
-            mqtt_set_command("H")
-            print("MQTT command -> STOP")
-        else:
-            print("MQTT unknown raw command:", text)
-        return
-    if "power_ref_w" in data:
-        mqtt_number_to_command(data.get("power_ref_w"))
-        print("MQTT JSON power_ref_w ->", data.get("power_ref_w"))
-        return
-    cmd = str(
-        data.get("command",
-        data.get("cmd",
-        data.get("action",
-        data.get("state", ""))))
-    ).lower()
-    mode_value = str(data.get("mode", "")).lower()
-    if cmd == "set_mode" and mode_value:
-        cmd = mode_value
-    energy = None
-    for key in ("energy_j", "energy", "joules", "target_energy_j"):
-        if key in data:
-            try:
-                energy = float(data[key])
-            except:
-                energy = None
-            break
-    if energy is None:
-        energy = E_STEP
-    if cmd in ("store", "charge", "charging", "s"):
-        mqtt_set_command("S", energy)
-        print("MQTT JSON command -> STORE {:.3f}J".format(energy))
-    elif cmd in ("extract", "discharge", "discharging", "e"):
-        mqtt_set_command("E", energy)
-        print("MQTT JSON command -> EXTRACT {:.3f}J".format(energy))
-    elif cmd in ("maintain", "hold", "float", "u"):
-        mqtt_set_command("U")
-        print("MQTT JSON command -> MAINTAIN")
-    elif cmd in ("stop", "off", "halt", "emergency_stop", "h"):
-        mqtt_set_command("H")
-        print("MQTT JSON command -> STOP")
-    else:
-        print("MQTT unknown JSON command:", data)
-
 def mqtt_callback(topic, payload):
-    payload_text = mqtt_decode_payload(payload)
-    print("MQTT RX topic={} payload={}".format(topic, payload_text))
+    try:
+        text = payload.decode().strip()
+    except:
+        text = str(payload).strip()
+
+    print("MQTT RX:", topic, text)
+
     if topic == MQTT_TOPIC_EMERGENCY:
-        lower = payload_text.lower()
-        if lower in ("1", "true", "yes", "on", "stop", "emergency", "emergency_stop"):
+        if text.lower() not in ("0", "false", "off", "clear"):
             mqtt_set_command("H")
-            print("MQTT emergency -> STOP")
         return
+
     if topic == MQTT_TOPIC_RESTART:
-        lower = payload_text.lower()
-        if lower in ("1", "true", "yes", "on", "restart", "reset"):
+        if text.lower() not in ("0", "false", "off"):
             print("MQTT restart requested.")
             if machine is not None:
                 machine.reset()
         return
-    if topic == MQTT_TOPIC_COMMAND:
-        mqtt_parse_command_payload(payload_text)
 
-def wifi_connect(block_ms=8000):
-    global wlan, last_led_toggle_ms, led_state
-    if not WIFI_ENABLED:
-        return False
-    if not MQTT_AVAILABLE:
-        return False
-    if wlan is None:
-        wlan = network.WLAN(network.STA_IF)
-        wlan.active(True)
-    if wlan.isconnected():
-        return True
-    print("Connecting WiFi SSID={} ...".format(WIFI_SSID))
+    if topic != MQTT_TOPIC_COMMAND:
+        return
+
+    first = text[:1].upper()
+
+    # Raw commands: S10, E5, U, H
+    if first in ("S", "E"):
+        energy = parse_energy_amount(text[1:])
+        if energy is not None:
+            mqtt_set_command(first, energy)
+        return
+
+    if text.upper() in ("U", "H"):
+        mqtt_set_command(text.upper())
+        return
+
+    # JSON commands
+    if json is None:
+        print("JSON module unavailable.")
+        return
+
     try:
-        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        data = json.loads(text)
     except Exception as e:
-        print("WiFi connect error:", e)
-        return False
-    start = time.ticks_ms()
-    while not wlan.isconnected():
-        now = time.ticks_ms()
-        if time.ticks_diff(now, start) >= block_ms:
-            print("WiFi connect timeout. Continuing serial-only.")
-            return False
-        if time.ticks_diff(now, last_led_toggle_ms) >= 250:
-            last_led_toggle_ms = now
-            led_state = 1 - led_state
-            led.value(led_state)
-        time.sleep_ms(50)
-    led.on()
-    print("WiFi connected:", wlan.ifconfig())
-    return True
+        print("Invalid MQTT command:", e)
+        return
 
-def mqtt_disconnect_silent():
-    global mqtt_client, mqtt_connected
-    try:
-        if mqtt_client:
-            mqtt_client.disconnect()
-    except:
-        pass
-    mqtt_client = None
-    mqtt_connected = False
+    if not isinstance(data, dict):
+        print("Invalid MQTT command:", data)
+        return
 
-def mqtt_connect():
-    global mqtt_client, mqtt_connected, last_mqtt_reconnect_ms
-    if not MQTT_ENABLED:
+    # Positive power = STORE
+    # Negative power = EXTRACT
+    # Zero power = MAINTAIN
+    if "power_ref_w" in data:
+        try:
+            power = float(data["power_ref_w"])
+        except:
+            print("Invalid power_ref_w.")
+            return
+
+        if abs(power) < 0.001:
+            mqtt_set_command("U")
+        else:
+            energy = abs(power) * STORE_TIME_MS / 1000.0
+            mqtt_set_command("S" if power > 0 else "E", energy)
+        return
+
+    cmd = str(data.get("command", "")).lower()
+    energy = data.get("energy_j", E_STEP)
+
+    if cmd in ("store", "charge"):
+        mqtt_set_command("S", energy)
+    elif cmd in ("extract", "discharge"):
+        mqtt_set_command("E", energy)
+    elif cmd in ("maintain", "hold"):
+        mqtt_set_command("U")
+    elif cmd in ("stop", "off"):
+        mqtt_set_command("H")
+    else:
+        print("Unknown MQTT command:", data)
+
+def mqtt_connect():         #include wifi
+    global mqtt_client, last_mqtt_retry_ms
+
+    if not MQTT_ENABLED or not MQTT_AVAILABLE:
         return False
-    if not MQTT_AVAILABLE:
+
+    if wlan is None:
         return False
-    last_mqtt_reconnect_ms = time.ticks_ms()
-    if not wifi_connect():
-        mqtt_connected = False
+
+    if mqtt_client is not None:
+        return True
+
+    now_ms = time.ticks_ms()
+
+    if (
+        last_mqtt_retry_ms != 0
+        and time.ticks_diff(now_ms, last_mqtt_retry_ms) < MQTT_RETRY_MS
+    ):
         return False
+
+    last_mqtt_retry_ms = now_ms
+
+    if not wlan.isconnected():
+        print("Connecting WiFi:", WIFI_SSID)
+
+        try:
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        except Exception as e:
+            print("WiFi error:", e)
+
+        return False
+
     try:
         mqtt_client = MQTTClient(
             MQTT_CLIENT_ID,
@@ -723,95 +638,92 @@ def mqtt_connect():
             port=MQTT_PORT,
             keepalive=30
         )
+
         mqtt_client.set_callback(mqtt_callback)
         mqtt_client.connect()
+
         mqtt_client.subscribe(MQTT_TOPIC_COMMAND)
         mqtt_client.subscribe(MQTT_TOPIC_EMERGENCY)
         mqtt_client.subscribe(MQTT_TOPIC_RESTART)
-        mqtt_connected = True
+
         led.on()
+
         print(
-            "MQTT connected: {}:{} client_id={}".format(
+            "MQTT connected: {}:{}".format(
                 MQTT_BROKER,
-                MQTT_PORT,
-                MQTT_CLIENT_ID
+                MQTT_PORT
             )
         )
-        print("MQTT subscribed:", MQTT_TOPIC_COMMAND)
-        print("MQTT subscribed:", MQTT_TOPIC_EMERGENCY)
-        print("MQTT subscribed:", MQTT_TOPIC_RESTART)
+
         return True
+
     except Exception as e:
         print("MQTT connect error:", e)
-        mqtt_disconnect_silent()
+        mqtt_client = None
+        led.off()
         return False
 
-def mqtt_publish_telemetry(now_ms):
-    global last_mqtt_pub_ms
-    if not mqtt_connected or mqtt_client is None:
-        return
-    if time.ticks_diff(now_ms, last_mqtt_pub_ms) < MQTT_TELEMETRY_INTERVAL_MS:
-        return
-    last_mqtt_pub_ms = now_ms
-    try:
-        payload = {
-            "device": "supercap",
-            "mode": mode,
-            "status": mode.lower(),
-            "trip": trip,
-            "trip_reason": trip_reason,
-            "hard_stopped": hard_stopped,
-            "action_in_progress": action_in_progress,
-            "voltage": last_va,
-            "terminal_voltage": last_va_terminal,
-            "current": last_IL,
-            "power": last_va * last_IL,
-            "energy_j": last_E,
-            "energy_terminal_j": last_E_terminal,
-            "energy_plot_j": last_E_plot,
-            "soc": last_SoC,
-            "target_current": I_target,
-            "duty": duty,
-            "pwm_applied": last_pwm_applied,
-            "vbus": V_BUS,
-            "time_ms": now_ms
-        }
-        if json is not None:
-            msg = json.dumps(payload)
-        else:
-            msg = str(payload)
-        mqtt_client.publish(MQTT_TOPIC_TELEMETRY, msg)
-    except Exception as e:
-        print("MQTT publish error:", e)
-        mqtt_disconnect_silent()
-
 def mqtt_service(now_ms):
-    global mqtt_connected, last_mqtt_poll_ms
-    global last_mqtt_reconnect_ms, last_led_toggle_ms, led_state
+    global mqtt_client
+    global last_mqtt_poll_ms
+    global last_mqtt_publish_ms
+
     if not MQTT_ENABLED or not MQTT_AVAILABLE:
         return
-    if mqtt_connected:
-        led.on()
-    else:
-        if time.ticks_diff(now_ms, last_led_toggle_ms) >= 500:
-            last_led_toggle_ms = now_ms
-            led_state = 1 - led_state
-            led.value(led_state)
-    if not mqtt_connected:
-        if action_in_progress:
-            return
-        if time.ticks_diff(now_ms, last_mqtt_reconnect_ms) >= MQTT_RECONNECT_INTERVAL_MS:
+
+    if mqtt_client is None:
+        led.off()
+
+        if not action_in_progress:
             mqtt_connect()
+
         return
-    if time.ticks_diff(now_ms, last_mqtt_poll_ms) >= MQTT_POLL_INTERVAL_MS:
-        last_mqtt_poll_ms = now_ms
-        try:
+
+    try:
+        if time.ticks_diff(now_ms, last_mqtt_poll_ms) >= MQTT_POLL_MS:
+            last_mqtt_poll_ms = now_ms
             mqtt_client.check_msg()
-        except Exception as e:
-            print("MQTT check_msg error:", e)
-            mqtt_disconnect_silent()
-            return
-    mqtt_publish_telemetry(now_ms)
+
+        if time.ticks_diff(now_ms, last_mqtt_publish_ms) >= MQTT_PUBLISH_MS:
+            last_mqtt_publish_ms = now_ms
+
+            payload = {
+                "device": "supercap",
+                "mode": mode,
+                "status": mode.lower(),
+                "trip": trip,
+                "trip_reason": trip_reason,
+                "hard_stopped": hard_stopped,
+                "action_in_progress": action_in_progress,
+                "voltage": last_va,
+                "terminal_voltage": last_va_terminal,
+                "current": last_IL,
+                "power": last_va * last_IL,
+                "energy_j": last_E,
+                "energy_terminal_j": last_E_terminal,
+                "energy_plot_j": last_E_plot,
+                "soc": last_SoC,
+                "target_current": I_target,
+                "duty": duty,
+                "pwm_applied": last_pwm_applied,
+                "vbus": V_BUS,
+                "time_ms": now_ms
+            }
+
+            if json is not None:
+                msg = json.dumps(payload)
+            else:
+                msg = str(payload)
+
+            mqtt_client.publish(
+                MQTT_TOPIC_TELEMETRY,
+                msg.encode()
+            )
+
+    except Exception as e:
+        print("MQTT connection lost:", e)
+        mqtt_client = None
+        led.off()
 
 # ============================================================
 # Initialisation
