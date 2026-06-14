@@ -1,0 +1,1146 @@
+
+from machine import Pin, I2C, ADC, PWM, Timer
+import time
+try:
+    import machine
+except:
+    machine = None
+try:
+    import ujson as json
+except:
+    try:
+        import json
+    except:
+        json = None
+try:
+    import network
+    from umqtt.simple import MQTTClient
+    MQTT_AVAILABLE = True
+except Exception as e:
+    network = None
+    MQTTClient = None
+    MQTT_AVAILABLE = False
+    print("WiFi/MQTT import failed:", e)
+
+# ============================================================
+# Hardware setup
+# ============================================================
+
+va_pin = ADC(Pin(28))
+ina_i2c = I2C(
+    0,
+    scl=Pin(1),
+    sda=Pin(0),
+    freq=2400000
+)
+pwm = PWM(Pin(9))
+pwm.freq(100000)
+MIN_PWM = 1000
+MAX_PWM = 64536
+duty = 0
+duty_cmd = 0.0
+last_pwm_applied = 0
+pwm.duty_u16(0)
+led = Pin("LED", Pin.OUT)
+led.on()
+
+# ============================================================
+# WiFi / MQTT settings
+# ============================================================
+
+WIFI_ENABLED = True
+WIFI_SSID = "Hong"
+WIFI_PASSWORD = "abcdefgh"
+MQTT_ENABLED = True
+MQTT_BROKER = "172.20.10.4"
+MQTT_PORT = 1884
+MQTT_CLIENT_ID = b"team01_supercap"
+MQTT_TOPIC_COMMAND = b"smartgrid/team01/supercap/command"
+MQTT_TOPIC_TELEMETRY = b"smartgrid/team01/supercap/telemetry"
+MQTT_TOPIC_EMERGENCY = b"smartgrid/team01/system/emergency"
+MQTT_TOPIC_RESTART = b"smartgrid/team01/system/restart"
+MQTT_RECONNECT_INTERVAL_MS = 5000
+MQTT_POLL_INTERVAL_MS = 50
+MQTT_TELEMETRY_INTERVAL_MS = 500
+wlan = None
+mqtt_client = None
+mqtt_connected = False
+last_mqtt_reconnect_ms = 0
+last_mqtt_poll_ms = 0
+last_mqtt_pub_ms = 0
+last_led_toggle_ms = 0
+led_state = 1
+
+# ============================================================
+# Controller parameters
+# ============================================================
+
+V_BUS      = 10
+C          = 0.5
+SHUNT_OHMS = 0.10
+CAP_ESR_OHMS = 2.0           # Two 4 ohm capacitors in parallel -> 2 ohm total ESR
+dt         = 1 / 1000.0
+VCAP_MIN = 10.0
+VCAP_WORK_MAX = 15.7
+VCAP_HARD_MAX = 16.6
+VCAP_STORE_MIN = 8.5
+STOPPED_CURRENT_BLOCK_STORE = 0.20
+E_MIN = 0.5 * C * VCAP_MIN ** 2
+E_WORK_MAX = 0.5 * C * VCAP_WORK_MAX ** 2
+E_MAX = 0.5 * C * VCAP_HARD_MAX ** 2
+E_STEP = 15.0                 # Default energy when S/E has no number, J
+STORE_TIME_MS = 5000         # Store target time: 5 seconds
+E_PLOT_ALPHA = 0.03
+ADC_CUBIC = 0.0037     # Cubic term  (fitted from calibration data)
+ADC_QUAD  = 0.0125     # Quadratic term (fitted from calibration data)
+I_STORE    =  0.60          # Faster but safer store current target, A
+I_EXTRACT  = -0.60          # Safer extract current target, A
+I_MAINTAIN =  0.025           # Smaller maintain current target, A
+I_LIMIT    =  1.20          # Hard overcurrent trip limit, A
+STORE_SAFE_START_PWM = 1000
+STORE_PWM_HARD_MAX_BASE = 12520
+STORE_PWM_HARD_MAX_HIGH = 30000
+STORE_HIGH_VCAP = 10.4
+STORE_PWM_MAX_STEP_UP = 25.0       # Base ramp-up below 12.5 V
+STORE_PWM_MAX_STEP_UP_MID = 35.0   # Faster ramp-up from 12.5 V
+STORE_PWM_MAX_STEP_UP_HIGH = 45.0  # Fastest ramp-up from 13.8 V
+STORE_PWM_STEP_MID_VCAP = 12.5
+STORE_PWM_STEP_HIGH_VCAP = 13.8
+STORE_PWM_MAX_STEP_DOWN = 320.0
+MAINTAIN_PWM_MIN = 5600
+MAINTAIN_PWM_MAX_STEP_UP = 4.0
+MAINTAIN_PWM_MAX_STEP_DOWN = 35.0
+MAINTAIN_ENTRY_PWM_MARGIN = 1000
+MAINTAIN_REVERSE_CURRENT_LIMIT = -0.20
+MAINTAIN_RECOVERY_PWM_MAX = 24000
+I_SAFE_HOLD = 0.04
+EXTRACT_EXIT_PWM_STEP = 300         # First handover step from final EXTRACT PWM
+MAINTAIN_SOFT_RAMP_MS = 1400        # Time to ramp MAINTAIN minimum upward after EXTRACT
+EXTRACT_BRAKE_1_J = 4.00
+EXTRACT_BRAKE_2_J = 2.50
+EXTRACT_BRAKE_3_J = 1.50
+EXTRACT_BRAKE_4_J = 0.80
+EXTRACT_BRAKE_5_J = 0.35
+I_EXTRACT_BRAKE_1 = -0.45
+I_EXTRACT_BRAKE_2 = -0.30
+I_EXTRACT_BRAKE_3 = -0.18
+I_EXTRACT_BRAKE_4 = -0.09
+I_EXTRACT_BRAKE_5 = -0.035
+EXTRACT_DONE_TOL_J = 0.25
+V_HOLD_REF = VCAP_MIN
+V_HOLD_BAND = 0.04
+I_VHOLD_CHARGE = 0.08
+I_VHOLD_FLOAT = 0.02
+I_VHOLD_DISCHARGE = -0.02
+IL_FILTER_ALPHA = 0.20
+IL_filtered = 0.0
+EXTRACT_PWM_MAX_STEP = 22.0
+EXTRACT_MIN_PWM = 0
+STORE_REVERSE_CURRENT_LIMIT = -0.10
+SOFT_STOP_STEP = 300
+SOFT_STOP_DELAY_MS = 1
+
+# ============================================================
+# PID settings
+# ============================================================
+
+KP_STORE = 200.0
+KI_STORE = 25.0
+KD_STORE = 0.0
+KP_MAINTAIN = 45.0
+KI_MAINTAIN = 6.0
+KD_MAINTAIN = 0.0
+KP_EXTRACT = 150.0
+KI_EXTRACT = 18.0
+KD_EXTRACT = 0.0
+int_err = 0.0
+prev_err = 0.0
+INT_MIN = -0.8
+INT_MAX = 0.8
+
+# ============================================================
+# Runtime state
+# ============================================================
+
+I_target = 0.0
+E_initial = 0.0
+E_delta = 0.0
+E_target_action = 0.0
+action_in_progress = False
+action_start_ms = 0
+maintain_soft_active = False
+maintain_soft_start_pwm = 0
+maintain_soft_target_pwm = 0
+maintain_soft_start_ms = 0
+mode = "STOPPED"
+command = ""
+command_energy_j = E_STEP
+hard_stopped = True
+trip = False
+trip_reason = ""
+E_plot = 0.0
+last_va = 0.0
+last_va_terminal = 0.0
+last_IL = 0.0
+last_E = 0.0
+last_E_terminal = 0.0
+last_E_plot = 0.0
+last_SoC = 0.0
+
+# ============================================================
+# INA219 current sensor
+# ============================================================
+
+class INA219:
+    REG_SHUNT = 0x01
+    def __init__(self, shunt, addr):
+        self.shunt = shunt
+        self.addr = addr
+    def vshunt(self):
+        raw = ina_i2c.readfrom_mem(self.addr, self.REG_SHUNT, 2)
+        value = int.from_bytes(raw, "big")
+        if value >= 2 ** 15:
+            value -= 2 ** 16
+        return float(value) * 1e-5
+    def configure(self):
+        ina_i2c.writeto_mem(self.addr, 0x00, b"\x19\x9F")
+        ina_i2c.writeto_mem(self.addr, 0x05, b"\x00\x00")
+
+# ============================================================
+# Control helper functions
+# ============================================================
+
+def tick(t):
+    global timer_elapsed
+    timer_elapsed = 1
+
+def clamp(value, lower, upper):
+    return max(min(value, upper), lower)
+
+def read_vcap():
+    raw_v = 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
+    if raw_v > 10.0:
+        z = raw_v - 10.0
+        return raw_v + ADC_CUBIC * z * z * z + ADC_QUAD * z * z
+    return raw_v
+
+def correct_vcap_for_esr(v_terminal, cap_current):
+    return v_terminal - cap_current * CAP_ESR_OHMS
+
+def reset_pid():
+    global int_err, prev_err
+    int_err = 0.0
+    prev_err = 0.0
+
+def pid_current_step(target_current, measured_current, kp_use, ki_use, kd_use, step_limit):
+    global int_err, prev_err
+    err = target_current - measured_current
+    int_err += err * dt
+    int_err = clamp(int_err, INT_MIN, INT_MAX)
+    d_err = (err - prev_err) / dt
+    prev_err = err
+    output = kp_use * err + ki_use * int_err + kd_use * d_err
+    output = clamp(output, -step_limit, step_limit)
+    return output
+
+def calculate_store_start_pwm(vcap):
+    if vcap >= 14.2:
+        return 24500
+    if vcap >= 13.5:
+        return 22000
+    if vcap >= 12.5:
+        return 19500
+    if vcap >= 11.5:
+        return 17500
+    if vcap >= 10.8:
+        return 13500
+    if vcap >= 10.3:
+        return 8500
+    return STORE_SAFE_START_PWM
+
+def get_store_pwm_hard_max(vcap):
+    if vcap >= STORE_HIGH_VCAP:
+        return STORE_PWM_HARD_MAX_HIGH
+    return STORE_PWM_HARD_MAX_BASE
+
+def get_store_pwm_step_up(vcap):
+    if vcap >= STORE_PWM_STEP_HIGH_VCAP:
+        return STORE_PWM_MAX_STEP_UP_HIGH
+    if vcap >= STORE_PWM_STEP_MID_VCAP:
+        return STORE_PWM_MAX_STEP_UP_MID
+    return STORE_PWM_MAX_STEP_UP
+
+def calculate_store_warm_start_pwm(vcap):
+    if (not hard_stopped) and last_pwm_applied > 0:
+        return int(clamp(
+            last_pwm_applied,
+            MIN_PWM,
+            get_store_pwm_hard_max(vcap)
+        ))
+    return int(clamp(
+        calculate_store_start_pwm(vcap),
+        MIN_PWM,
+        get_store_pwm_hard_max(vcap)
+    ))
+
+def pwm_off():
+    global duty, duty_cmd, last_pwm_applied, hard_stopped
+    duty = 0
+    duty_cmd = 0.0
+    last_pwm_applied = 0
+    pwm.duty_u16(0)
+    hard_stopped = True
+
+def pwm_soft_off():
+    global duty, duty_cmd, last_pwm_applied, hard_stopped
+    temp = int(last_pwm_applied)
+    while temp > 0:
+        temp -= SOFT_STOP_STEP
+        if temp < 0:
+            temp = 0
+        pwm.duty_u16(temp)
+        time.sleep_ms(SOFT_STOP_DELAY_MS)
+    duty = 0
+    duty_cmd = 0.0
+    last_pwm_applied = 0
+    hard_stopped = True
+
+def pwm_start(initial_pwm):
+    global duty, duty_cmd, last_pwm_applied, hard_stopped
+    duty = int(clamp(initial_pwm, MIN_PWM, MAX_PWM))
+    duty_cmd = float(duty)
+    last_pwm_applied = duty
+    pwm.duty_u16(last_pwm_applied)
+    hard_stopped = False
+    reset_pid()
+
+def enter_safe_hold(reason):
+    global trip, trip_reason, command
+    global action_in_progress, mode, I_target
+    global duty, duty_cmd, last_pwm_applied, hard_stopped, IL_filtered
+    recovery_pwm = calculate_safe_recovery_pwm(last_va)
+    if not trip:
+        print("TRIP:", reason)
+        print("Overcurrent safe hold.")
+    trip = True
+    trip_reason = reason
+    command = ""
+    action_in_progress = False
+    I_target = I_SAFE_HOLD
+    mode = "SAFE_HOLD"
+    duty = int(recovery_pwm)
+    duty_cmd = float(duty)
+    last_pwm_applied = duty
+    pwm.duty_u16(last_pwm_applied)
+    hard_stopped = False
+    IL_filtered = last_IL
+    reset_pid()
+
+def do_trip(reason, reverse_hold=False):
+    global trip, trip_reason, command
+    global action_in_progress, mode, I_target
+    if reverse_hold:
+        enter_safe_hold(reason)
+        return
+    if not trip:
+        print("TRIP:", reason)
+    trip = True
+    trip_reason = reason
+    command = ""
+    action_in_progress = False
+    I_target = 0.0
+    mode = "TRIPPED"
+    pwm_off()
+
+def do_stop():
+    global trip, trip_reason, command
+    global action_in_progress, mode, I_target
+    global E_delta, E_target_action
+    trip = False
+    trip_reason = ""
+    pwm_soft_off()
+    mode = "STOPPED"
+    I_target = 0.0
+    action_in_progress = False
+    E_delta = 0.0
+    E_target_action = 0.0
+    reset_pid()
+    command = ""
+    print("Stopped. Send S/E/U to resume.")
+
+def do_maintain(va):
+    global command, mode, I_target, action_in_progress
+    global E_delta, E_target_action, IL_filtered
+    global duty, duty_cmd, last_pwm_applied
+    if hard_stopped:
+        pwm_start(MAINTAIN_PWM_MIN)
+    else:
+        maintain_entry_max = calculate_maintain_min_pwm(va) + MAINTAIN_ENTRY_PWM_MARGIN
+        if last_pwm_applied > maintain_entry_max:
+            duty = int(clamp(maintain_entry_max, MIN_PWM, MAX_PWM))
+            duty_cmd = float(duty)
+            last_pwm_applied = duty
+            pwm.duty_u16(last_pwm_applied)
+    IL_filtered = last_IL
+    command = ""
+    mode = "MAINTAIN"
+    if va >= VCAP_HARD_MAX:
+        I_target = 0.0
+    else:
+        I_target = I_MAINTAIN
+    action_in_progress = False
+    E_delta = 0.0
+    E_target_action = 0.0
+    reset_pid()
+
+def calculate_vhold_current(va):
+    if va < V_HOLD_REF - V_HOLD_BAND:
+        return I_VHOLD_CHARGE
+    if va > V_HOLD_REF + V_HOLD_BAND:
+        return I_VHOLD_DISCHARGE
+    return I_VHOLD_FLOAT
+
+def calculate_safe_recovery_pwm(va):
+    if va >= 14.0:
+        return 23000
+    if va >= 12.5:
+        value = 14500 + (va - 12.5) * 4000
+        return int(clamp(value, 14500, 23000))
+    if va >= 10.5:
+        value = 9000 + (va - 10.5) * 2750
+        return int(clamp(value, 9000, 14500))
+    return 8500
+
+def calculate_maintain_min_pwm(va):
+    safe_pwm = calculate_safe_recovery_pwm(va) - 2500
+    return int(clamp(safe_pwm, MAINTAIN_PWM_MIN, 23000))
+
+def calculate_active_maintain_min_pwm(va):
+    global maintain_soft_active
+    normal_min = calculate_maintain_min_pwm(va)
+    if not maintain_soft_active:
+        return normal_min
+    elapsed_ms = time.ticks_diff(time.ticks_ms(), maintain_soft_start_ms)
+    if elapsed_ms >= MAINTAIN_SOFT_RAMP_MS:
+        maintain_soft_active = False
+        return normal_min
+    if maintain_soft_target_pwm <= maintain_soft_start_pwm:
+        return normal_min
+    ramp_pwm = maintain_soft_start_pwm + (
+        (maintain_soft_target_pwm - maintain_soft_start_pwm)
+        * elapsed_ms
+        / MAINTAIN_SOFT_RAMP_MS
+    )
+    if ramp_pwm > normal_min:
+        ramp_pwm = normal_min
+    return int(clamp(ramp_pwm, MAINTAIN_PWM_MIN, normal_min))
+
+def calculate_extract_target_current(E_now, current_va):
+    terminal_floor_limit = VCAP_MIN + 0.2
+    dynamic_I_limit = -(current_va - terminal_floor_limit) / CAP_ESR_OHMS
+    base_taper_target = -clamp(
+        -dynamic_I_limit,
+        0.035,
+        abs(I_EXTRACT)
+    )
+    target_E = E_initial - E_target_action
+    remaining_J = E_now - target_E
+    energy_limit = I_EXTRACT
+    if remaining_J <= EXTRACT_BRAKE_5_J:
+        energy_limit = I_EXTRACT_BRAKE_5
+    elif remaining_J <= EXTRACT_BRAKE_4_J:
+        energy_limit = I_EXTRACT_BRAKE_4
+    elif remaining_J <= EXTRACT_BRAKE_3_J:
+        energy_limit = I_EXTRACT_BRAKE_3
+    elif remaining_J <= EXTRACT_BRAKE_2_J:
+        energy_limit = I_EXTRACT_BRAKE_2
+    elif remaining_J <= EXTRACT_BRAKE_1_J:
+        energy_limit = I_EXTRACT_BRAKE_1
+    elapsed_ms = time.ticks_diff(time.ticks_ms(), action_start_ms)
+    scale = E_target_action / 10.0
+    scale = clamp(scale, 0.65, 1.30)
+    t1 = int(1100 * scale)
+    t2 = int(1700 * scale)
+    t3 = int(2300 * scale)
+    t4 = int(3000 * scale)
+    t5 = int(3700 * scale)
+    time_limit = I_EXTRACT
+    if elapsed_ms >= t5:
+        time_limit = I_EXTRACT_BRAKE_5
+    elif elapsed_ms >= t4:
+        time_limit = I_EXTRACT_BRAKE_4
+    elif elapsed_ms >= t3:
+        time_limit = I_EXTRACT_BRAKE_3
+    elif elapsed_ms >= t2:
+        time_limit = I_EXTRACT_BRAKE_2
+    elif elapsed_ms >= t1:
+        time_limit = I_EXTRACT_BRAKE_1
+    return max(base_taper_target, energy_limit, time_limit)
+
+def enter_maintain_after_extract(va):
+    global duty, duty_cmd, last_pwm_applied
+    global maintain_soft_active, maintain_soft_start_pwm
+    global maintain_soft_target_pwm, maintain_soft_start_ms
+    final_extract_pwm = int(last_pwm_applied)
+    normal_min = calculate_maintain_min_pwm(va)
+    target_pwm = final_extract_pwm + EXTRACT_EXIT_PWM_STEP
+    if target_pwm > normal_min:
+        target_pwm = normal_min
+    if target_pwm < MIN_PWM:
+        target_pwm = MIN_PWM
+    duty = int(clamp(target_pwm, MIN_PWM, MAX_PWM))
+    duty_cmd = float(duty)
+    last_pwm_applied = duty
+    pwm.duty_u16(last_pwm_applied)
+    maintain_soft_active = True
+    maintain_soft_start_pwm = duty
+    maintain_soft_target_pwm = normal_min
+    maintain_soft_start_ms = time.ticks_ms()
+    print("EXTRACT handover.")
+    do_maintain(va)
+
+def do_voltage_hold_floor(va):
+    global command, mode, I_target, action_in_progress
+    global E_delta, E_target_action, IL_filtered
+    if hard_stopped:
+        pwm_start(MAINTAIN_PWM_MIN)
+    IL_filtered = last_IL
+    command = ""
+    mode = "V_HOLD"
+    I_target = calculate_vhold_current(va)
+    action_in_progress = False
+    E_delta = 0.0
+    E_target_action = 0.0
+    reset_pid()
+
+def recover_from_maintain_reverse_current(IL):
+    global duty, duty_cmd, last_pwm_applied, IL_filtered
+    recovery_pwm = last_pwm_applied + 800
+    if recovery_pwm > MAINTAIN_RECOVERY_PWM_MAX:
+        recovery_pwm = MAINTAIN_RECOVERY_PWM_MAX
+    print("MAINTAIN recovery.")
+    duty = int(clamp(recovery_pwm, MIN_PWM, MAX_PWM))
+    duty_cmd = float(duty)
+    last_pwm_applied = duty
+    pwm.duty_u16(last_pwm_applied)
+    IL_filtered = IL
+
+def parse_energy_amount(text):
+    text = text.strip()
+    if not text:
+        return E_STEP
+    if text[0] in "=:":
+        text = text[1:].strip()
+    if text.endswith("J"):
+        text = text[:-1].strip()
+    try:
+        value = float(text)
+    except:
+        return None
+    if value <= 0.0:
+        return None
+    return value
+
+
+# ============================================================
+# WiFi / MQTT helper functions
+# ============================================================
+
+def mqtt_decode_payload(payload):
+    try:
+        if isinstance(payload, bytes):
+            return payload.decode().strip()
+        return str(payload).strip()
+    except:
+        return ""
+
+def mqtt_set_command(cmd, energy=None):
+    global command, command_energy_j
+    cmd = cmd.upper().strip()
+    if cmd in ("S", "E"):
+        if energy is not None:
+            command_energy_j = energy
+        command = cmd
+    elif cmd in ("U", "H"):
+        command = cmd
+
+def mqtt_number_to_command(value):
+    try:
+        p = float(value)
+    except:
+        return
+    if abs(p) < 0.001:
+        mqtt_set_command("U")
+        return
+    energy = abs(p) * (STORE_TIME_MS / 1000.0)
+    if p > 0:
+        mqtt_set_command("S", energy)
+    else:
+        mqtt_set_command("E", energy)
+
+def mqtt_parse_command_payload(payload_text):
+    """
+    Accepted examples:
+    Raw text:
+      S10
+      E5
+      U
+      H
+      store
+      extract
+      maintain
+      stop
+      3.0      -> STORE power_ref_w=3W for 5s
+      -2.0     -> EXTRACT power_ref_w=2W for 5s
+    JSON:
+      {"command":"store","energy_j":10}
+      {"command":"extract","energy_j":5}
+      {"command":"maintain"}
+      {"command":"stop"}
+      {"command":"set_mode","mode":"charge","energy_j":10}
+      {"command":"set_mode","mode":"discharge","energy_j":5}
+      {"power_ref_w":3.0}
+      {"power_ref_w":-2.0}
+    """
+    text = payload_text.strip()
+    if not text:
+        return
+    first = text[0].upper()
+    if first in ("S", "E"):
+        amount = parse_energy_amount(text[1:])
+        if amount is None:
+            print("MQTT invalid energy command:", text)
+            return
+        mqtt_set_command(first, amount)
+        print("MQTT command -> {}{:.3f}J".format(first, amount))
+        return
+    if text.upper() in ("U", "H"):
+        mqtt_set_command(text.upper())
+        print("MQTT command ->", text.upper())
+        return
+    try:
+        value = float(text)
+        mqtt_number_to_command(value)
+        print("MQTT power_ref_w ->", value)
+        return
+    except:
+        pass
+    data = None
+    if json is not None and text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except Exception as e:
+            print("MQTT JSON parse error:", e)
+            return
+    if data is None:
+        word = text.lower()
+        if word in ("store", "charge", "charging"):
+            mqtt_set_command("S", E_STEP)
+            print("MQTT command -> STORE default {:.3f}J".format(E_STEP))
+        elif word in ("extract", "discharge", "discharging"):
+            mqtt_set_command("E", E_STEP)
+            print("MQTT command -> EXTRACT default {:.3f}J".format(E_STEP))
+        elif word in ("maintain", "hold", "float"):
+            mqtt_set_command("U")
+            print("MQTT command -> MAINTAIN")
+        elif word in ("stop", "off", "halt", "emergency_stop"):
+            mqtt_set_command("H")
+            print("MQTT command -> STOP")
+        else:
+            print("MQTT unknown raw command:", text)
+        return
+    if "power_ref_w" in data:
+        mqtt_number_to_command(data.get("power_ref_w"))
+        print("MQTT JSON power_ref_w ->", data.get("power_ref_w"))
+        return
+    cmd = str(
+        data.get("command",
+        data.get("cmd",
+        data.get("action",
+        data.get("state", ""))))
+    ).lower()
+    mode_value = str(data.get("mode", "")).lower()
+    if cmd == "set_mode" and mode_value:
+        cmd = mode_value
+    energy = None
+    for key in ("energy_j", "energy", "joules", "target_energy_j"):
+        if key in data:
+            try:
+                energy = float(data[key])
+            except:
+                energy = None
+            break
+    if energy is None:
+        energy = E_STEP
+    if cmd in ("store", "charge", "charging", "s"):
+        mqtt_set_command("S", energy)
+        print("MQTT JSON command -> STORE {:.3f}J".format(energy))
+    elif cmd in ("extract", "discharge", "discharging", "e"):
+        mqtt_set_command("E", energy)
+        print("MQTT JSON command -> EXTRACT {:.3f}J".format(energy))
+    elif cmd in ("maintain", "hold", "float", "u"):
+        mqtt_set_command("U")
+        print("MQTT JSON command -> MAINTAIN")
+    elif cmd in ("stop", "off", "halt", "emergency_stop", "h"):
+        mqtt_set_command("H")
+        print("MQTT JSON command -> STOP")
+    else:
+        print("MQTT unknown JSON command:", data)
+
+def mqtt_callback(topic, payload):
+    payload_text = mqtt_decode_payload(payload)
+    print("MQTT RX topic={} payload={}".format(topic, payload_text))
+    if topic == MQTT_TOPIC_EMERGENCY:
+        lower = payload_text.lower()
+        if lower in ("1", "true", "yes", "on", "stop", "emergency", "emergency_stop"):
+            mqtt_set_command("H")
+            print("MQTT emergency -> STOP")
+        return
+    if topic == MQTT_TOPIC_RESTART:
+        lower = payload_text.lower()
+        if lower in ("1", "true", "yes", "on", "restart", "reset"):
+            print("MQTT restart requested.")
+            if machine is not None:
+                machine.reset()
+        return
+    if topic == MQTT_TOPIC_COMMAND:
+        mqtt_parse_command_payload(payload_text)
+
+def wifi_connect(block_ms=8000):
+    global wlan, last_led_toggle_ms, led_state
+    if not WIFI_ENABLED:
+        return False
+    if not MQTT_AVAILABLE:
+        return False
+    if wlan is None:
+        wlan = network.WLAN(network.STA_IF)
+        wlan.active(True)
+    if wlan.isconnected():
+        return True
+    print("Connecting WiFi SSID={} ...".format(WIFI_SSID))
+    try:
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    except Exception as e:
+        print("WiFi connect error:", e)
+        return False
+    start = time.ticks_ms()
+    while not wlan.isconnected():
+        now = time.ticks_ms()
+        if time.ticks_diff(now, start) >= block_ms:
+            print("WiFi connect timeout. Continuing serial-only.")
+            return False
+        if time.ticks_diff(now, last_led_toggle_ms) >= 250:
+            last_led_toggle_ms = now
+            led_state = 1 - led_state
+            led.value(led_state)
+        time.sleep_ms(50)
+    led.on()
+    print("WiFi connected:", wlan.ifconfig())
+    return True
+
+def mqtt_disconnect_silent():
+    global mqtt_client, mqtt_connected
+    try:
+        if mqtt_client:
+            mqtt_client.disconnect()
+    except:
+        pass
+    mqtt_client = None
+    mqtt_connected = False
+
+def mqtt_connect():
+    global mqtt_client, mqtt_connected, last_mqtt_reconnect_ms
+    if not MQTT_ENABLED:
+        return False
+    if not MQTT_AVAILABLE:
+        return False
+    last_mqtt_reconnect_ms = time.ticks_ms()
+    if not wifi_connect():
+        mqtt_connected = False
+        return False
+    try:
+        mqtt_client = MQTTClient(
+            MQTT_CLIENT_ID,
+            MQTT_BROKER,
+            port=MQTT_PORT,
+            keepalive=30
+        )
+        mqtt_client.set_callback(mqtt_callback)
+        mqtt_client.connect()
+        mqtt_client.subscribe(MQTT_TOPIC_COMMAND)
+        mqtt_client.subscribe(MQTT_TOPIC_EMERGENCY)
+        mqtt_client.subscribe(MQTT_TOPIC_RESTART)
+        mqtt_connected = True
+        led.on()
+        print(
+            "MQTT connected: {}:{} client_id={}".format(
+                MQTT_BROKER,
+                MQTT_PORT,
+                MQTT_CLIENT_ID
+            )
+        )
+        print("MQTT subscribed:", MQTT_TOPIC_COMMAND)
+        print("MQTT subscribed:", MQTT_TOPIC_EMERGENCY)
+        print("MQTT subscribed:", MQTT_TOPIC_RESTART)
+        return True
+    except Exception as e:
+        print("MQTT connect error:", e)
+        mqtt_disconnect_silent()
+        return False
+
+def mqtt_publish_telemetry(now_ms):
+    global last_mqtt_pub_ms
+    if not mqtt_connected or mqtt_client is None:
+        return
+    if time.ticks_diff(now_ms, last_mqtt_pub_ms) < MQTT_TELEMETRY_INTERVAL_MS:
+        return
+    last_mqtt_pub_ms = now_ms
+    try:
+        payload = {
+            "device": "supercap",
+            "mode": mode,
+            "status": mode.lower(),
+            "trip": trip,
+            "trip_reason": trip_reason,
+            "hard_stopped": hard_stopped,
+            "action_in_progress": action_in_progress,
+            "voltage": last_va,
+            "terminal_voltage": last_va_terminal,
+            "current": last_IL,
+            "power": last_va * last_IL,
+            "energy_j": last_E,
+            "energy_terminal_j": last_E_terminal,
+            "energy_plot_j": last_E_plot,
+            "soc": last_SoC,
+            "target_current": I_target,
+            "duty": duty,
+            "pwm_applied": last_pwm_applied,
+            "vbus": V_BUS,
+            "time_ms": now_ms
+        }
+        if json is not None:
+            msg = json.dumps(payload)
+        else:
+            msg = str(payload)
+        mqtt_client.publish(MQTT_TOPIC_TELEMETRY, msg)
+    except Exception as e:
+        print("MQTT publish error:", e)
+        mqtt_disconnect_silent()
+
+def mqtt_service(now_ms):
+    global mqtt_connected, last_mqtt_poll_ms
+    global last_mqtt_reconnect_ms, last_led_toggle_ms, led_state
+    if not MQTT_ENABLED or not MQTT_AVAILABLE:
+        return
+    if mqtt_connected:
+        led.on()
+    else:
+        if time.ticks_diff(now_ms, last_led_toggle_ms) >= 500:
+            last_led_toggle_ms = now_ms
+            led_state = 1 - led_state
+            led.value(led_state)
+    if not mqtt_connected:
+        if action_in_progress:
+            return
+        if time.ticks_diff(now_ms, last_mqtt_reconnect_ms) >= MQTT_RECONNECT_INTERVAL_MS:
+            mqtt_connect()
+        return
+    if time.ticks_diff(now_ms, last_mqtt_poll_ms) >= MQTT_POLL_INTERVAL_MS:
+        last_mqtt_poll_ms = now_ms
+        try:
+            mqtt_client.check_msg()
+        except Exception as e:
+            print("MQTT check_msg error:", e)
+            mqtt_disconnect_silent()
+            return
+    mqtt_publish_telemetry(now_ms)
+
+# ============================================================
+# Initialisation
+# ============================================================
+
+timer_elapsed = 0
+ina = INA219(SHUNT_OHMS, 64)
+ina.configure()
+loop_r = Timer(
+    mode=Timer.PERIODIC,
+    freq=1000,
+    callback=tick
+)
+print("Ready. v40 clean control version. Commands: S[J] E[J] U H")
+print("PWM initially OFF. MQTT interface enabled if WiFi is available.")
+print("MQTT config: broker={}:{} command_topic={} telemetry_topic={}".format(MQTT_BROKER, MQTT_PORT, MQTT_TOPIC_COMMAND, MQTT_TOPIC_TELEMETRY))
+mqtt_connect()
+
+# ============================================================
+# Main loop
+# ============================================================
+
+while True:
+    if not timer_elapsed:
+        continue
+    timer_elapsed = 0
+    try:
+        va_terminal = read_vcap()
+        IL = -ina.vshunt() / SHUNT_OHMS
+        va = correct_vcap_for_esr(va_terminal, IL)
+    except Exception as e:
+        do_trip("sensor error: " + str(e))
+        continue
+    E = 0.5 * C * va ** 2
+    E_terminal = 0.5 * C * va_terminal ** 2
+    if E_plot <= 0.0:
+        E_plot = E
+    else:
+        E_plot = (1.0 - E_PLOT_ALPHA) * E_plot + E_PLOT_ALPHA * E
+    SoC = clamp(E / E_MAX * 100.0, 0.0, 100.0)
+    last_va = va
+    last_va_terminal = va_terminal
+    last_IL = IL
+    last_E = E
+    last_E_terminal = E_terminal
+    last_E_plot = E_plot
+    last_SoC = SoC
+    now_ms = time.ticks_ms()
+    mqtt_service(now_ms)
+    if (
+        not trip
+        and not hard_stopped
+        and mode == "STORE"
+        and IL <= STORE_REVERSE_CURRENT_LIMIT
+    ):
+        do_trip("store reverse current {:.3f}A".format(IL), reverse_hold=True)
+        continue
+    if (
+        not trip
+        and not hard_stopped
+        and (mode == "MAINTAIN" or mode == "V_HOLD")
+        and IL <= MAINTAIN_REVERSE_CURRENT_LIMIT
+    ):
+        recover_from_maintain_reverse_current(IL)
+        continue
+    if not trip and not hard_stopped and abs(IL) >= I_LIMIT:
+        do_trip("overcurrent {:.3f}A".format(IL), reverse_hold=True)
+        continue
+    if not trip and not hard_stopped and va >= VCAP_HARD_MAX:
+        do_trip("hard overvoltage {:.3f}V".format(va))
+        continue
+    if (
+        not trip
+        and not hard_stopped
+        and mode == "STORE"
+        and va >= VCAP_WORK_MAX
+    ):
+        if action_in_progress:
+            E_delta = E - E_initial
+        print("STORE finished.")
+        do_maintain(va)
+        continue
+    if not trip and mode == "EXTRACT" and va <= VCAP_MIN:
+        if action_in_progress:
+            E_delta = E - E_initial
+        print("EXTRACT floor reached.")
+        do_voltage_hold_floor(va)
+        continue
+    if command == "H":
+        do_stop()
+    elif command == "U":
+        if trip:
+            print("Trip active - send H first.")
+            command = ""
+        else:
+            do_maintain(va)
+    if command == "S":
+        command = ""
+        if trip:
+            if hard_stopped and abs(IL) <= STOPPED_CURRENT_BLOCK_STORE:
+                print("Trip flag cleared automatically for STORE start.")
+                trip = False
+                trip_reason = ""
+            else:
+                print("STORE blocked.")
+        if trip:
+            pass
+        elif action_in_progress:
+            print("Action in progress.")
+        elif va < VCAP_STORE_MIN:
+            print("STORE blocked.")
+        elif hard_stopped and abs(IL) > STOPPED_CURRENT_BLOCK_STORE:
+            print("STORE blocked.")
+        elif E >= E_WORK_MAX - 0.05:
+            print("Already at limit.")
+        else:
+            start_pwm = calculate_store_warm_start_pwm(va)
+            if hard_stopped:
+                pwm_start(start_pwm)
+            else:
+                duty = int(clamp(start_pwm, MIN_PWM, get_store_pwm_hard_max(va)))
+                duty_cmd = float(duty)
+                last_pwm_applied = duty
+                pwm.duty_u16(last_pwm_applied)
+                hard_stopped = False
+                reset_pid()
+            E_initial = E
+            E_delta = 0.0
+            E_target_action = min(command_energy_j, E_WORK_MAX - E)
+            I_target = I_STORE
+            action_in_progress = True
+            mode = "STORE"
+            action_start_ms = time.ticks_ms()
+            IL_filtered = IL
+            reset_pid()
+            print("STORE started.")
+    if command == "E" and not trip:
+        command = ""
+        if action_in_progress:
+            print("Action in progress.")
+        elif E <= E_MIN + 0.05:
+            print("Already at limit.")
+            if not hard_stopped:
+                do_voltage_hold_floor(va)
+        elif hard_stopped:
+            print("Info.")
+        else:
+            start_pwm = int(clamp(last_pwm_applied, MIN_PWM, MAX_PWM))
+            pwm_start(start_pwm)
+            E_initial = E
+            E_delta = 0.0
+            E_target_action = min(command_energy_j, E - E_MIN)
+            I_target = I_EXTRACT
+            action_in_progress = True
+            mode = "EXTRACT"
+            action_start_ms = time.ticks_ms()
+            IL_filtered = IL
+            reset_pid()
+            print("EXTRACT started.")
+    if not trip and action_in_progress:
+        E_delta = E - E_initial
+        elapsed_ms = time.ticks_diff(time.ticks_ms(), action_start_ms)
+        if mode == "STORE":
+            if va >= VCAP_WORK_MAX:
+                print("STORE finished.")
+                do_maintain(va)
+            elif E_delta >= E_target_action:
+                print("STORE finished.")
+                do_maintain(va)
+            elif elapsed_ms >= STORE_TIME_MS:
+                print("STORE timeout.")
+                do_maintain(va)
+        elif mode == "EXTRACT":
+            if E_delta <= -(E_target_action - EXTRACT_DONE_TOL_J):
+                print("EXTRACT finished.")
+                enter_maintain_after_extract(va)
+            elif elapsed_ms >= STORE_TIME_MS:
+                print("EXTRACT timeout.")
+                enter_maintain_after_extract(va)
+                print("Hardware protected -> Dropping to MAINTAIN.")
+    control_allowed = (not hard_stopped) and ((not trip) or mode == "SAFE_HOLD")
+    if control_allowed:
+        if mode == "STORE":
+            terminal_ceiling = VCAP_WORK_MAX - 0.2
+            dynamic_I = (terminal_ceiling - va) / CAP_ESR_OHMS
+            if va >= VCAP_WORK_MAX:
+                I_target = 0.0
+            else:
+                I_target = clamp(dynamic_I, 0.0, I_STORE)
+            energy_remaining = E_target_action - E_delta
+            if action_in_progress:
+                if energy_remaining < 4.0:
+                    I_target = min(I_target, 0.35)
+                if energy_remaining < 2.5:
+                    I_target = min(I_target, 0.22)
+                if energy_remaining < 1.5:
+                    I_target = min(I_target, 0.12)
+                if energy_remaining < 0.8:
+                    I_target = min(I_target, 0.05)
+                if energy_remaining < 0.35:
+                    I_target = min(I_target, 0.02)
+            IL_filtered = (
+                (1.0 - IL_FILTER_ALPHA) * IL_filtered
+                + IL_FILTER_ALPHA * IL
+            )
+            if I_target <= 0.0:
+                reset_pid()
+                pwm_step = -STORE_PWM_MAX_STEP_DOWN
+            else:
+                raw_pid_step = pid_current_step(
+                    I_target,
+                    IL_filtered,
+                    KP_STORE,
+                    KI_STORE,
+                    KD_STORE,
+                    STORE_PWM_MAX_STEP_DOWN
+                )
+                if raw_pid_step >= 0:
+                    pwm_step = clamp(
+                        raw_pid_step,
+                        0.0,
+                        get_store_pwm_step_up(va)
+                    )
+                else:
+                    pwm_step = clamp(
+                        raw_pid_step,
+                        -STORE_PWM_MAX_STEP_DOWN,
+                        0.0
+                    )
+            duty_cmd = clamp(
+                duty_cmd + pwm_step,
+                MIN_PWM,
+                get_store_pwm_hard_max(va)
+            )
+            duty = int(duty_cmd)
+        elif mode == "MAINTAIN" or mode == "SAFE_HOLD" or mode == "V_HOLD":
+            if mode == "V_HOLD":
+                I_target = calculate_vhold_current(va)
+            IL_filtered = (
+                (1.0 - IL_FILTER_ALPHA) * IL_filtered
+                + IL_FILTER_ALPHA * IL
+            )
+            raw_pid_step = pid_current_step(
+                I_target,
+                IL_filtered,
+                KP_MAINTAIN,
+                KI_MAINTAIN,
+                KD_MAINTAIN,
+                MAINTAIN_PWM_MAX_STEP_DOWN
+            )
+            if raw_pid_step >= 0:
+                pwm_step = clamp(
+                    raw_pid_step,
+                    0.0,
+                    MAINTAIN_PWM_MAX_STEP_UP
+                )
+            else:
+                pwm_step = clamp(
+                    raw_pid_step,
+                    -MAINTAIN_PWM_MAX_STEP_DOWN,
+                    0.0
+                )
+            duty_cmd = clamp(
+                duty_cmd + pwm_step,
+                calculate_active_maintain_min_pwm(va),
+                get_store_pwm_hard_max(va)
+            )
+            duty = int(duty_cmd)
+        elif mode == "EXTRACT":
+            IL_filtered = (
+                (1.0 - IL_FILTER_ALPHA) * IL_filtered
+                + IL_FILTER_ALPHA * IL
+            )
+            I_target = calculate_extract_target_current(E_plot, va)
+            pwm_step = pid_current_step(
+                I_target,
+                IL_filtered,
+                KP_EXTRACT,
+                KI_EXTRACT,
+                KD_EXTRACT,
+                EXTRACT_PWM_MAX_STEP
+            )
+            duty_cmd = clamp(
+                duty_cmd + pwm_step,
+                EXTRACT_MIN_PWM,
+                MAX_PWM
+            )
+            duty = int(duty_cmd)
+        last_pwm_applied = duty
+        pwm.duty_u16(last_pwm_applied)
