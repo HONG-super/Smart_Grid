@@ -437,4 +437,3 @@ while True:
 
         if count > 1000:
             count = 0
-```
