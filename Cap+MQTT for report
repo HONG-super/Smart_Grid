@@ -127,18 +127,11 @@ I_EXTRACT_BRAKE_3 = -0.18
 I_EXTRACT_BRAKE_4 = -0.09
 I_EXTRACT_BRAKE_5 = -0.035
 EXTRACT_DONE_TOL_J = 0.25
-V_HOLD_REF = VCAP_MIN
-V_HOLD_BAND = 0.04
-I_VHOLD_CHARGE = 0.08
-I_VHOLD_FLOAT = 0.02
-I_VHOLD_DISCHARGE = -0.02
 IL_FILTER_ALPHA = 0.20
 IL_filtered = 0.0
 EXTRACT_PWM_MAX_STEP = 22.0
 EXTRACT_MIN_PWM = 0
 STORE_REVERSE_CURRENT_LIMIT = -0.10
-SOFT_STOP_STEP = 300
-SOFT_STOP_DELAY_MS = 1
 
 # ============================================================
 # PID settings
@@ -291,20 +284,6 @@ def pwm_off():
     pwm.duty_u16(0)
     hard_stopped = True
 
-def pwm_soft_off():
-    global duty, duty_cmd, last_pwm_applied, hard_stopped
-    temp = int(last_pwm_applied)
-    while temp > 0:
-        temp -= SOFT_STOP_STEP
-        if temp < 0:
-            temp = 0
-        pwm.duty_u16(temp)
-        time.sleep_ms(SOFT_STOP_DELAY_MS)
-    duty = 0
-    duty_cmd = 0.0
-    last_pwm_applied = 0
-    hard_stopped = True
-
 def pwm_start(initial_pwm):
     global duty, duty_cmd, last_pwm_applied, hard_stopped
     duty = int(clamp(initial_pwm, MIN_PWM, MAX_PWM))
@@ -358,7 +337,7 @@ def do_stop():
     global E_delta, E_target_action
     trip = False
     trip_reason = ""
-    pwm_soft_off()
+    pwm_off()
     mode = "STOPPED"
     I_target = 0.0
     action_in_progress = False
@@ -392,13 +371,6 @@ def do_maintain(va):
     E_delta = 0.0
     E_target_action = 0.0
     reset_pid()
-
-def calculate_vhold_current(va):
-    if va < V_HOLD_REF - V_HOLD_BAND:
-        return I_VHOLD_CHARGE
-    if va > V_HOLD_REF + V_HOLD_BAND:
-        return I_VHOLD_DISCHARGE
-    return I_VHOLD_FLOAT
 
 def calculate_safe_recovery_pwm(va):
     if va >= 14.0:
@@ -498,20 +470,6 @@ def enter_maintain_after_extract(va):
     maintain_soft_start_ms = time.ticks_ms()
     print("EXTRACT handover.")
     do_maintain(va)
-
-def do_voltage_hold_floor(va):
-    global command, mode, I_target, action_in_progress
-    global E_delta, E_target_action, IL_filtered
-    if hard_stopped:
-        pwm_start(MAINTAIN_PWM_MIN)
-    IL_filtered = last_IL
-    command = ""
-    mode = "V_HOLD"
-    I_target = calculate_vhold_current(va)
-    action_in_progress = False
-    E_delta = 0.0
-    E_target_action = 0.0
-    reset_pid()
 
 def recover_from_maintain_reverse_current(IL):
     global duty, duty_cmd, last_pwm_applied, IL_filtered
@@ -914,7 +872,7 @@ while True:
     if (
         not trip
         and not hard_stopped
-        and (mode == "MAINTAIN" or mode == "V_HOLD")
+        and mode == "MAINTAIN"
         and IL <= MAINTAIN_REVERSE_CURRENT_LIMIT
     ):
         recover_from_maintain_reverse_current(IL)
@@ -940,7 +898,7 @@ while True:
         if action_in_progress:
             E_delta = E - E_initial
         print("EXTRACT floor reached.")
-        do_voltage_hold_floor(va)
+        do_maintain(va)
         continue
     if command == "H":
         do_stop()
@@ -997,7 +955,7 @@ while True:
         elif E <= E_MIN + 0.05:
             print("Already at limit.")
             if not hard_stopped:
-                do_voltage_hold_floor(va)
+                do_maintain(va)
         elif hard_stopped:
             print("Info.")
         else:
@@ -1089,9 +1047,7 @@ while True:
                 get_store_pwm_hard_max(va)
             )
             duty = int(duty_cmd)
-        elif mode == "MAINTAIN" or mode == "SAFE_HOLD" or mode == "V_HOLD":
-            if mode == "V_HOLD":
-                I_target = calculate_vhold_current(va)
+        elif mode == "MAINTAIN" or mode == "SAFE_HOLD":
             IL_filtered = (
                 (1.0 - IL_FILTER_ALPHA) * IL_filtered
                 + IL_FILTER_ALPHA * IL
