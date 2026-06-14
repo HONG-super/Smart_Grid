@@ -1,4 +1,3 @@
-```python
 from machine import Pin, I2C, ADC, PWM, Timer
 import utime
 
@@ -427,4 +426,3 @@ while True:
 
         if count > 1000:
             count = 0
-```
