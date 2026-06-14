@@ -1,14 +1,7 @@
-# The main difference is we solve the problem in a more complex way at first
-# In this method we only use PI control and get rid of the CL/OL
-# we also change the way of calculating the duty cycle in previous version we can only let the PWM change between a small range around the PWM_base while in this case we use a inverse PWM 
-# and duty = 65536 - PI_output and the intergal increases very fast resulting the settling time is small
-# Less is more
-
 from machine import Pin, I2C, ADC, PWM, Timer
 import utime
 
-# WiFi / MQTT imports are optional so the original control code can still run
-# even if the MQTT library is missing on the Pico W.
+
 try:
     import network
     from umqtt.simple import MQTTClient
@@ -17,23 +10,20 @@ except Exception as e:
     MQTTClient = None
     print("WiFi/MQTT import failed:", e)
 
-# Save test results to CSV
+#CSV
 SAVE_RESULTS = True
 RESULTS_FILE = "external_grid_10V_nopv_2.csv"
-LOG_DURATION_MS = 60000        # record for 30 seconds
-LOG_PERIOD_MS = 10             # write one row every 10 ms
-LOG_FLUSH_PERIOD_MS = 1000     # flush every 1 second
+LOG_DURATION_MS = 60000        
+LOG_PERIOD_MS = 10             
+LOG_FLUSH_PERIOD_MS = 1000    
 
-# ============================================================
-# WiFi / MQTT settings
-# ============================================================
-
+#WiFi / MQTT settings
 MQTT_ENABLE = True
 
 WIFI_SSID = "Hong"
 WIFI_PASSWORD = "abcdefgh"
 
-# Current broker host for the smartgrid MQTT setup
+#broker host
 MQTT_BROKER = "172.20.10.4"
 MQTT_PORT = 1884
 MQTT_CLIENT_ID = b"grid_pico_w"
@@ -45,9 +35,9 @@ MQTT_RECONNECT_PERIOD_MS = 5000
 WIFI_RECONNECT_PERIOD_MS = 5000
 LED_BLINK_PERIOD_MS = 250
 
-# ============================================================
 # Hardware setup
-# ============================================================
+led = Pin("LED", Pin.OUT)
+led.off()
 
 va_pin = ADC(Pin(28))
 vb_pin = ADC(Pin(26))
@@ -56,41 +46,26 @@ ina_i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=2400000)
 
 pwm = PWM(Pin(9))
 pwm.freq(100000)
-
-# LED status only: blinking = WiFi/MQTT connecting, solid ON = both connected.
-led = Pin("LED", Pin.OUT)
-led.off()
-
 min_pwm = 1000
 max_pwm = 64536
 pwm_out = min_pwm
 
-# ============================================================
 # Controller settings
-# ============================================================
 
-kp = 150
-ki = 300
-
-# Changed from 7.05 V to 10.00 V
 v_ref = 10.00
-
 v_err = 0.0
 v_err_int = 0.0
 v_pi_out = 0.0
+kp = 150
+ki = 300
 
-# Integral limit
-V_ERR_INT_LIMIT = 10000
-
-# Shunt resistance
-SHUNT_OHMS = 0.10
-
-# Timer variables
 timer_elapsed = 0
 count = 0
 first_run = 1
 
-# Logging variables
+SHUNT_OHMS = 0.10
+
+# log
 results = None;
 log_start_ms = 0
 last_log_ms = 0
@@ -110,10 +85,6 @@ last_mqtt_attempt_ms = 0
 last_led_ms = 0
 led_state = 0
 
-# ============================================================
-# Helper functions
-# ============================================================
-
 def saturate(signal, upper, lower):
     if signal > upper:
         signal = upper
@@ -121,12 +92,9 @@ def saturate(signal, upper, lower):
         signal = lower
     return signal
 
-
-
 def tick(t):
     global timer_elapsed
     timer_elapsed = 1
-
 
 def led_blink_update(now_ms):
     global last_led_ms
@@ -137,21 +105,14 @@ def led_blink_update(now_ms):
         led_state = 1 - led_state
         led.value(led_state)
 
-
-def led_status_update():
-    # LED meaning:
-    # - blinking: WiFi or MQTT is still connecting / reconnecting
-    # - solid ON: WiFi and MQTT are both connected
-    # - OFF: MQTT feature disabled or WiFi/MQTT module missing
+def led_status_update():             # solid is success
     if (not MQTT_ENABLE) or (network is None) or (MQTTClient is None):
         led.off()
         return
-
     if wifi_connected and mqtt_connected:
         led.on()
     else:
         led_blink_update(utime.ticks_ms())
-
 
 def get_wlan():
     global wlan
@@ -162,43 +123,32 @@ def get_wlan():
     if wlan is None:
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
-
     return wlan
-
 
 def start_wifi_connect(now_ms):
     global wifi_connecting
     global wifi_connect_start_ms
     global last_wifi_attempt_ms
-
     w = get_wlan()
-
     if w is None:
         return False
-
     try:
         w.active(True)
-
-        # Clear a stale partial connection before a new attempt.
         try:
             w.disconnect()
         except Exception:
             pass
-
         print("WiFi connecting to SSID:", WIFI_SSID)
         w.connect(WIFI_SSID, WIFI_PASSWORD)
-
         wifi_connecting = True
         wifi_connect_start_ms = now_ms
         last_wifi_attempt_ms = now_ms
         return True
-
     except Exception as e:
         print("WiFi start connect exception:", e)
         wifi_connecting = False
         last_wifi_attempt_ms = now_ms
         return False
-
 
 def update_wifi_connection():
     global wifi_connected
@@ -210,27 +160,21 @@ def update_wifi_connection():
     if (not MQTT_ENABLE) or (network is None):
         wifi_connected = False
         return False
-
     now_ms = utime.ticks_ms()
     w = get_wlan()
-
     if w is None:
         wifi_connected = False
         return False
-
     try:
         if w.isconnected():
             if not wifi_connected:
                 print("WiFi connected. IP =", w.ifconfig()[0])
-
             wifi_connected = True
             wifi_connecting = False
             return True
 
     except Exception as e:
         print("WiFi status check failed:", e)
-
-    # WiFi is not connected here. MQTT must also be treated as disconnected.
     if wifi_connected:
         print("WiFi lost. Reconnecting...")
 
@@ -274,12 +218,9 @@ def connect_wifi():
 
     while True:
         now_connect_ms = utime.ticks_ms()
-
         if update_wifi_connection():
             return True
-
         led_status_update()
-
         if utime.ticks_diff(now_connect_ms, last_status_print_ms) >= 1000:
             last_status_print_ms = now_connect_ms
             try:
@@ -350,11 +291,7 @@ def publish_grid_telemetry(vb, power, import_power, export_power):
             pass
         mqtt_client = None
 
-
-# ============================================================
-# INA219 current sensor
-# ============================================================
-
+# INA219
 class ina219:
 
     REG_CONFIG = 0x00
@@ -372,11 +309,9 @@ class ina219:
         reg_bytes = ina_i2c.readfrom_mem(self.address, self.REG_SHUNTVOLTAGE, 2)
         reg_value = int.from_bytes(reg_bytes, "big")
 
-        # Signed 16-bit conversion
         if reg_value >= 0x8000:
             reg_value = reg_value - 0x10000
 
-        # INA219 shunt voltage LSB = 10 uV
         return float(reg_value) * 1e-5
 
     def vbus(self):
@@ -385,22 +320,17 @@ class ina219:
         return float(reg_value) * 0.004
 
     def configure(self):
-        # PG = /8
         ina_i2c.writeto_mem(self.address, self.REG_CONFIG, b"\x19\x9F")
-
-        # Calibration disabled because current is calculated manually
         ina_i2c.writeto_mem(self.address, self.REG_CALIBRATION, b"\x00\x00")
 
-
-# ============================================================
 # Main loop
-# ============================================================
-
 while True:
 
     if first_run:
         ina = ina219(SHUNT_OHMS, 64, 5)
         ina.configure()
+        first_run = 0
+        loop_timer = Timer(mode=Timer.PERIODIC, freq=1000, callback=tick)
 
         if MQTT_ENABLE:
             wifi_connected = connect_wifi()
@@ -424,32 +354,7 @@ while True:
         last_mqtt_ms = log_start_ms
         last_mqtt_attempt_ms = log_start_ms
 
-        first_run = 0
-
-        loop_timer = Timer(mode=Timer.PERIODIC, freq=1000, callback=tick)
-
-        print("================================")
-        print("RUNNING EXTERNAL GRID CODE WITHOUT WIFI/MQTT")
-        print("CSV logging =", SAVE_RESULTS)
-        print("CSV file =", RESULTS_FILE)
-        print("LOG_DURATION_MS =", LOG_DURATION_MS)
-        print("Target Vb v_ref =", v_ref)
-        print("kp =", kp)
-        print("ki =", ki)
-        print("MQTT_ENABLE =", MQTT_ENABLE)
-        print("MQTT_BROKER =", MQTT_BROKER)
-        print("MQTT_PORT =", MQTT_PORT)
-        print("MQTT topic =", MQTT_TOPIC_GRID_TELEMETRY)
-        print("WiFi connected =", wifi_connected)
-        print("MQTT connected =", mqtt_connected)
-        print("================================")
-
     if timer_elapsed == 1:
-
-        # ------------------------------------------------------------
-        # Measurements
-        # ------------------------------------------------------------
-
         va = 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
         vb = 1.015 * (12490 / 2490) * 3.3 * (vb_pin.read_u16() / 65536)
 
@@ -457,38 +362,16 @@ while True:
         iL = Vshunt / SHUNT_OHMS
 
         power = vb * iL
-
-        if power < 0:
-            export_power = -power
-            import_power = 0
-        else:
-            export_power = 0
-            import_power = power
-
-        # ------------------------------------------------------------
-        # PI voltage controller
-        # ------------------------------------------------------------
-
-        v_err = v_ref - vb
-
-        v_err_int = v_err_int + v_err
-        v_err_int = saturate(v_err_int, V_ERR_INT_LIMIT, -V_ERR_INT_LIMIT)
-
-        v_pi_out = (kp * v_err) + (ki * v_err_int)
-
+        
         min_pwm = 0
-        max_pwm = 64536
-
+        max_pwm = 64536    
+        v_err = v_ref - vb
+        v_err_int = v_err_int + v_err
+        v_err_int = saturate(v_err_int, 10000, -10000)
+        v_pi_out = (kp * v_err) + (ki * v_err_int)
         pwm_out = saturate(v_pi_out, max_pwm, min_pwm)
-
-        # Original code uses inverted PWM
         duty = int(65536 - pwm_out)
-
         pwm.duty_u16(duty)
-
-        # ------------------------------------------------------------
-        # CSV logging
-        # ------------------------------------------------------------
 
         if SAVE_RESULTS and (not log_done):
             now_ms = utime.ticks_ms()
@@ -526,17 +409,10 @@ while True:
                 log_done = True
                 print("CSV logging finished. File saved as:", RESULTS_FILE)
 
-        # ------------------------------------------------------------
-        # MQTT telemetry publishing
-        # ------------------------------------------------------------
-
+# MQTT telemetry publishe
         if MQTT_ENABLE:
             now_mqtt_ms = utime.ticks_ms()
-
-            # WiFi is checked and retried continuously. This fixes the case
-            # where the first boot attempt fails and the old code never tries
-            # WiFi again.
-            wifi_connected = update_wifi_connection()
+            wifi_connected = update_wifi_connection() #update wifi 
 
             if (not mqtt_connected) and wifi_connected:
                 if utime.ticks_diff(now_mqtt_ms, last_mqtt_attempt_ms) >= MQTT_RECONNECT_PERIOD_MS:
@@ -545,31 +421,12 @@ while True:
 
             if utime.ticks_diff(now_mqtt_ms, last_mqtt_ms) >= MQTT_PUBLISH_PERIOD_MS:
                 last_mqtt_ms = now_mqtt_ms
-                publish_grid_telemetry(vb, power, import_power, export_power)
+                publish_grid_telemetry(vb, power)
 
             led_status_update()
-
-        # ------------------------------------------------------------
-        # Slow serial print
-        # ------------------------------------------------------------
-
+            
         count = count + 1
         timer_elapsed = 0
 
         if count > 1000:
             count = 0
-
-            #print("Va = {:.3f}".format(va))
-            #print("Vb = {:.3f}".format(vb))
-            #print("iL = {:.3f}".format(iL))
-            #print("Power = {:.3f}".format(power))
-            #print("Import power = {:.3f}".format(import_power))
-            #print("Export power = {:.3f}".format(export_power))
-            #print("v_ref = {:.3f}".format(v_ref))
-            #print("v_err = {:.4f}".format(v_err))
-            #print("v_err_int = {:.4f}".format(v_err_int))
-            #print("v_pi_out = {:.3f}".format(v_pi_out))
-            #print("pwm_out = {:.3f}".format(pwm_out))
-            #print("duty cycle = {:d}".format(duty))
-            #print("logging_done =", log_done)
-            #print("----------------------")
