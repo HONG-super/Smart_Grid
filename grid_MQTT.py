@@ -1,3 +1,4 @@
+```python
 from machine import Pin, I2C, ADC, PWM, Timer
 import utime
 
@@ -362,6 +363,13 @@ while True:
         iL = Vshunt / SHUNT_OHMS
 
         power = vb * iL
+
+        if power < 0:
+            export_power = -power
+            import_power = 0
+        else:
+            export_power = 0
+            import_power = power
         
         min_pwm = 0
         max_pwm = 64536    
@@ -421,7 +429,7 @@ while True:
 
             if utime.ticks_diff(now_mqtt_ms, last_mqtt_ms) >= MQTT_PUBLISH_PERIOD_MS:
                 last_mqtt_ms = now_mqtt_ms
-                publish_grid_telemetry(vb, power)
+                publish_grid_telemetry(vb, power, import_power, export_power)
 
             led_status_update()
             
@@ -430,3 +438,4 @@ while True:
 
         if count > 1000:
             count = 0
+```
